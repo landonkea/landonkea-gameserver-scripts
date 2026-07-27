@@ -81,6 +81,14 @@ fi                       # end of the terminal detection block
 : "${LOG_FILE:=/var/log/gameserver-install.log}" # set default only if LOG_FILE is empty/unset
 
 ###############################################################################
+# STEAMCMD DOWNLOAD URL
+# Valve's official SteamCMD tarball location, shared by every installer
+# that needs to download SteamCMD for game server updates.
+###############################################################################
+
+readonly STEAMCMD_URL="https://steamcdn-a.akamaihd.net/client/installer/steamcmd_linux.tar.gz" # Valve's CDN URL for the SteamCMD Linux tarball
+
+###############################################################################
 # LOGGING FUNCTIONS
 # These functions print colored status messages to the terminal AND
 # append plain-text (no color codes) timestamps lines to the log file.
@@ -792,7 +800,370 @@ instance_config_file() { # define the instance_config_file function
 } # end of instance_config_file()
 
 ###############################################################################
-# END OF common.sh
-# This file defines functions only -- nothing is executed when sourced.
-# Callers pick which functions they need and call them explicitly.
+# STEAMCMD INSTALLATION
+# Downloads and installs Valve's SteamCMD if it isn't already present.
+# Used by both the Valheim installer and the multi-game platform installer.
+###############################################################################
+
+# install_steamcmd(): downloads and extracts SteamCMD into a target directory.
+# Takes two arguments: the directory where SteamCMD should live, and a
+# temporary directory for the download. Skips the download if SteamCMD is
+# already present, making it safe to call repeatedly (idempotent).
+install_steamcmd() { # define the install_steamcmd function
+    local steamcmd_dir="$1"   # first argument: where to install SteamCMD
+    local base_tmp_dir="$2"   # second argument: temp dir for the download archive
+    if [[ -f "${steamcmd_dir}/steamcmd.sh" ]]; then # if SteamCMD is already installed
+        log_info "SteamCMD already present at ${steamcmd_dir}; skipping download." # blue info: nothing to do
+        return 0 # return success -- no work needed
+    fi # end of the already-installed check
+    mkdir -p "$steamcmd_dir" # create the SteamCMD directory if it doesn't exist
+    log_info "Downloading SteamCMD..." # blue info: starting the download
+    curl_with_retry -fsSL "$STEAMCMD_URL" -o "${base_tmp_dir}/steamcmd_linux.tar.gz" \
+        || { log_err "SteamCMD download failed."; return 1; } # fatal if the download fails
+    tar -xzf "${base_tmp_dir}/steamcmd_linux.tar.gz" -C "$steamcmd_dir" --strip-components=1 \
+        || { log_err "SteamCMD extraction failed."; rm -f "${base_tmp_dir}/steamcmd_linux.tar.gz"; return 1; } # clean up and fail if extraction fails
+    rm -f "${base_tmp_dir}/steamcmd_linux.tar.gz" # remove the downloaded tarball after successful extraction
+    chmod +x "${steamcmd_dir}/steamcmd.sh" # make the steamcmd.sh launcher script executable
+    log_ok "SteamCMD installed at ${steamcmd_dir}." # green success message
+} # end of install_steamcmd()
+
+###############################################################################
+# FIREWALL (UFW) HELPERS
+# Shared functions for managing UFW rules across all installers.
+###############################################################################
+
+# configure_firewall_base(): one-time firewall setup -- allows SSH traffic
+# on the detected or configured port. Skips gracefully if UFW is not
+# installed (e.g. on systems that use a different firewall or none at all).
+configure_firewall_base() { # define the configure_firewall_base function
+    local ssh_port="$1" # first argument: the SSH port to allow through the firewall
+    if ! command_exists ufw; then # check if UFW is installed on this system
+        log_warn "UFW not installed; skipping firewall configuration." # yellow warning: can't configure what isn't there
+        return 0 # not fatal -- some systems don't use UFW
+    fi # end of the UFW availability check
+    ufw allow "${ssh_port}/tcp" comment 'SSH' >/dev/null 2>&1 || true # allow SSH traffic; silently ignore if rule already exists
+    log_ok "Firewall: SSH port ${ssh_port} allowed." # green success message
+} # end of configure_firewall_base()
+
+# configure_firewall_ports(): opens a list of port specifications for a
+# named game server instance. Each port spec is "port:protocol:label"
+# (e.g. "2456:udp:game"). Skips silently if UFW is not installed.
+configure_firewall_ports() { # define the configure_firewall_ports function
+    local instance_name="$1" # first argument: the instance name (used in the UFW comment)
+    shift # remove the instance name; remaining args are port specifications
+    local ports=("$@") # collect all remaining arguments into a ports array
+    if ! command_exists ufw; then return 0; fi # skip if UFW is not installed
+    for port_spec in "${ports[@]}"; do # loop through each port specification string
+        local port proto label # declare variables for the parsed components
+        IFS=':' read -r port proto label <<< "$port_spec" # split "port:protocol:label" on the colon delimiter
+        ufw allow "${port}/${proto}" comment "${instance_name}-${label}" >/dev/null 2>&1 || true # add the firewall rule; ignore if it already exists
+        log_ok "Firewall: ${instance_name} port ${port}/${proto} (${label}) allowed." # green success message for this port
+    done # end of the port specification loop
+} # end of configure_firewall_ports()
+
+# remove_firewall_for_instance(): removes all firewall rules for one
+# instance given its base port. Removes the base port and two offsets
+# (base+1, base+2) on both UDP and TCP to ensure a clean teardown.
+remove_firewall_for_instance() { # define the remove_firewall_for_instance function
+    local instance_name="$1" # first argument: instance name (used in the log message)
+    local port="$2" # second argument: the base port number for this instance
+    if ! command_exists ufw; then return 0; fi # skip if UFW is not installed
+    local port2=$((port + 1)) port3=$((port + 2)) # calculate the two offset ports (base+1 and base+2)
+    ufw delete allow "${port}/udp" 2>/dev/null || true # remove the base port UDP rule
+    ufw delete allow "${port}/tcp" 2>/dev/null || true # remove the base port TCP rule
+    ufw delete allow "${port2}/udp" 2>/dev/null || true # remove the offset+1 UDP rule
+    ufw delete allow "${port2}/tcp" 2>/dev/null || true # remove the offset+1 TCP rule
+    ufw delete allow "${port3}/udp" 2>/dev/null || true # remove the offset+2 UDP rule
+    ufw delete allow "${port3}/tcp" 2>/dev/null || true # remove the offset+2 TCP rule
+    log_ok "Firewall: rules for ${instance_name} removed." # green success message
+} # end of remove_firewall_for_instance()
+
+###############################################################################
+# FAIL2BAN CONFIGURATION
+# Writes a jail.local file for fail2ban SSH brute-force protection.
+# Idempotent -- safe to call on every install.
+###############################################################################
+
+# configure_fail2ban(): writes a fail2ban jail.local configuration file
+# that enables SSH brute-force protection. Backs up any existing file first,
+# then writes a fresh config and restarts the fail2ban service.
+configure_fail2ban() { # define the configure_fail2ban function
+    local fail2ban_jail_local="$1" # first argument: path to jail.local (e.g. /etc/fail2ban/jail.local)
+    if ! command_exists fail2ban-client; then # check if fail2ban is installed
+        log_info "fail2ban not installed; skipping." # blue info: nothing to configure
+        return 0 # not fatal -- some systems may not use fail2ban
+    fi # end of the fail2ban availability check
+    mkdir -p "$(dirname "$fail2ban_jail_local")" # ensure the parent directory exists (e.g. /etc/fail2ban/)
+    if [[ -f "$fail2ban_jail_local" ]]; then # if a jail.local already exists
+        cp "$fail2ban_jail_local" "${fail2ban_jail_local}.bak" 2>/dev/null || true # back it up before overwriting
+    fi # end of the existing-file check
+    cat > "$fail2ban_jail_local" << 'F2B' # write the jail config using a here-document (single-quoted delimiter prevents variable expansion)
+[DEFAULT] # default settings section -- applies to all jails unless overridden
+bantime = 3600 # ban an IP for 1 hour (3600 seconds) after exceeding maxretry
+findtime = 600 # within a 10-minute (600 second) window, count failed attempts
+maxretry = 5 # ban after 5 failed attempts within findtime (default for all jails)
+
+[gameserver] # jail definition specifically for game server SSH protection
+enabled = true # activate this jail (it won't run unless set to true)
+port = all # protect SSH on all ports (not just the default 22)
+filter = gameserver # use the "gameserver" filter (matches SSH auth failures)
+logpath = /var/log/auth.log # the log file fail2ban monitors for failed login attempts
+maxretry = 3 # stricter: ban after only 3 failed attempts (tighter than the global 5)
+F2B
+    systemctl restart fail2ban 2>/dev/null || true # restart fail2ban to pick up the new config; ignore errors
+    log_ok "fail2ban jail configured." # green success message
+} # end of configure_fail2ban()
+
+###############################################################################
+# LOG ROTATION
+# Writes a logrotate configuration for game server log files.
+###############################################################################
+
+# configure_logrotate(): writes a logrotate config that rotates a given
+# log file daily, keeps 7 days, compresses old logs, and sets ownership.
+# Parameters: config path, file owner, file group, and the log file path.
+configure_logrotate() { # define the configure_logrotate function
+    local logrotate_conf="$1" # first argument: where to write the logrotate config (e.g. /etc/logrotate.d/valheim)
+    local user="$2" # second argument: the user who owns the log files
+    local group="$3" # third argument: the group that owns the log files
+    local log_file="$4" # fourth argument: the absolute path to the log file to rotate
+    cat > "$logrotate_conf" << LR # write the logrotate config using a here-document
+${log_file} { # the log file path to rotate (parameterized, not hardcoded)
+    daily # rotate the log file every day
+    rotate 7 # keep 7 days (1 week) of rotated logs before deleting the oldest
+    compress # compress rotated log files with gzip to save disk space
+    delaycompress # wait one rotation cycle before compressing (so the most recent rotated file is uncompressed)
+    missingok # don't error if the log file doesn't exist (first run, etc.)
+    notifempty # don't rotate if the log file is empty (nothing to archive)
+    create 0640 ${user} ${group} # create new log files with owner=read+write, group=read, other=nothing
+}
+LR
+    log_ok "logrotate configured for ${log_file}." # green success message
+} # end of configure_logrotate()
+
+###############################################################################
+# JOURNALD LOG LIMIT
+# Caps systemd-journal disk usage to prevent logs from filling the disk.
+###############################################################################
+
+# configure_journald_limit(): sets the SystemMaxUse directive in
+# journald.conf to cap total journal disk usage. Removes any existing
+# SystemMaxUse line before adding the new value, then restarts journald.
+configure_journald_limit() { # define the configure_journald_limit function
+    local journald_conf="$1" # first argument: path to journald.conf (e.g. /etc/systemd/journald.conf)
+    local max_use="$2" # second argument: the max journal size (e.g. "2048M" or "500M")
+    if [[ ! -f "$journald_conf" ]]; then return 0; fi # skip if the config file doesn't exist
+    local tmp="${journald_conf}.tmp" # temporary file for the rewritten config
+    grep -vF 'SystemMaxUse=' "$journald_conf" > "$tmp" 2>/dev/null || true # remove any existing SystemMaxUse lines from the config
+    echo "SystemMaxUse=${max_use}" >> "$tmp" # append the new SystemMaxUse value
+    mv "$tmp" "$journald_conf" # replace the original config with the updated version
+    systemctl restart systemd-journald 2>/dev/null || true # restart journald to apply the new limit
+    log_ok "journald log limit set to ${max_use}." # green success message
+} # end of configure_journald_limit()
+
+###############################################################################
+# MONITORING SCRIPT GENERATION
+# Writes standardized host-monitoring helper scripts to a target directory.
+# Used by both the Valheim and multi-game platform installers, but
+# parameterized so each can point at its own base path.
+###############################################################################
+
+# write_monitoring_scripts_to_dir(): writes five monitoring scripts
+# (cpu-status.sh, ram-status.sh, disk-status.sh, smart-status.sh,
+# network-status.sh) into a target directory. All scripts are
+# parameterized by base_path so they reference the correct install root.
+write_monitoring_scripts_to_dir() { # define the write_monitoring_scripts_to_dir function
+    local target_dir="$1" # first argument: where to write the scripts (e.g. /srv/gameservers/scripts)
+    local base_path="$2" # second argument: the install root (e.g. /srv/gameservers or /srv/valheim)
+
+    cat > "${target_dir}/cpu-status.sh" << 'EOF' # write the CPU status script
+#!/usr/bin/env bash # use bash as the interpreter
+# cpu-status.sh - CPU model, topology, live usage snapshot, and top consumers
+set -uo pipefail # enable strict error handling
+echo "=== CPU Info ===" # section header for CPU information
+lscpu | grep -E 'Model name|Socket|Core\(s\) per socket|Thread\(s\) per core' || true # show CPU model and core topology
+echo # blank line for readability
+echo "=== Live Snapshot ===" # section header for current CPU usage
+top -bn1 | grep -i "Cpu(s)" || true # capture a single snapshot of CPU utilization from top
+echo # blank line for readability
+echo "=== Top CPU-consuming processes ===" # section header for process table
+ps aux --sort=-%cpu | head -n 10 # list the top 10 processes sorted by CPU usage (highest first)
+EOF
+
+    cat > "${target_dir}/ram-status.sh" << 'EOF' # write the RAM status script
+#!/usr/bin/env bash # use bash as the interpreter
+# ram-status.sh - memory usage and the top memory-consuming processes
+set -uo pipefail # enable strict error handling
+echo "=== Memory Usage ===" # section header for memory information
+free -h # display total, used, free, shared, and available memory in human-readable units
+echo # blank line for readability
+echo "=== Top memory-consuming processes ===" # section header for process table
+ps aux --sort=-%mem | head -n 10 # list the top 10 processes sorted by memory usage (highest first)
+EOF
+
+    cat > "${target_dir}/disk-status.sh" << EOF # write the disk status script (uses EOF unquoted for variable expansion)
+#!/usr/bin/env bash # use bash as the interpreter
+# disk-status.sh - filesystem usage and per-instance size breakdown
+set -uo pipefail # enable strict error handling
+echo "=== Disk Usage ===" # section header for filesystem usage
+df -h ${base_path} / # show disk free space for the install root and the root filesystem
+echo # blank line for readability
+echo "=== Per-Instance Sizes ===" # section header for per-instance disk usage
+du -sh ${base_path}/instances/*/ 2>/dev/null # show the total size of each instance directory (silently skip if none exist)
+echo # blank line for readability
+echo "=== Golden Install / SteamCMD ===" # section header for shared install sizes
+du -sh ${base_path}/golden/ ${base_path}/golden-server/ ${base_path}/steamcmd 2>/dev/null # show the size of the golden install(s) and SteamCMD
+EOF
+
+    cat > "${target_dir}/smart-status.sh" << 'EOF' # write the SMART status script
+#!/usr/bin/env bash # use bash as the interpreter
+# smart-status.sh - SMART health for every detected physical disk
+set -uo pipefail # enable strict error handling
+[[ $EUID -ne 0 ]] && echo "Note: run with sudo for complete SMART data." # warn if not root (some SMART data requires root)
+disks="$(lsblk -dn -o NAME 2>/dev/null | grep -E '^(sd|nvme|vd)' || true)" # list physical disk device names (sd*, nvme*, vd*)
+if [[ -z "$disks" ]]; then echo "No physical disks detected by lsblk."; exit 0; fi # exit gracefully if no disks found
+for disk in $disks; do # loop through each detected physical disk
+    echo "=== /dev/${disk} ===" # section header for this disk
+    smartctl -H "/dev/${disk}" 2>/dev/null || echo "  SMART data not available for /dev/${disk}." # show SMART health status (or say it's unavailable)
+    echo # blank line for readability
+done # end of the disk loop
+EOF
+
+    cat > "${target_dir}/network-status.sh" << EOF # write the network status script (uses EOF unquoted for variable expansion)
+#!/usr/bin/env bash # use bash as the interpreter
+# network-status.sh - interfaces, per-instance listening ports, and UFW status
+set -uo pipefail # enable strict error handling
+source ${target_dir}/common.sh # load the installer's common.sh for instance registry access
+echo "=== Network Interfaces ===" # section header for network interface info
+ip -brief addr show 2>/dev/null || ip addr show # show a brief list of network interfaces and their IPs
+echo # blank line for readability
+echo "=== Per-Instance Ports ===" # section header for per-instance port status
+printf '%-16s %-8s %s\n' "INSTANCE" "PORT" "LISTENING" # print table headers for instance name, port, and listening status
+while IFS=: read -r name port _; do # read the instance registry line by line, splitting on colon
+    [[ -n "$name" ]] || continue # skip empty lines
+    listening="no" # default to "not listening"
+    ss_output="\$(ss -uln 2>/dev/null)" # capture the list of listening UDP ports
+    grep -q ":${port}[[:space:]]" <<< "\$ss_output" && listening="yes" # check if this instance's port is in the list
+    printf '%-16s %-8s %s\n' "\$name" "\$port" "\$listening" # print a row for this instance
+done < "${base_path}/instances.registry" # read from the instance registry file
+echo # blank line for readability
+echo "=== UFW Status ===" # section header for firewall status
+ufw status verbose 2>/dev/null || echo "UFW not active or not installed." # show UFW status (or say it's not available)
+EOF
+
+    chmod 750 "${target_dir}"/{cpu-status.sh,ram-status.sh,disk-status.sh,smart-status.sh,network-status.sh} # make all monitoring scripts executable by owner and group
+    chown "${user:-root}:${group:-root}" "${target_dir}"/{cpu-status.sh,ram-status.sh,disk-status.sh,smart-status.sh,network-status.sh} 2>/dev/null || true # set ownership (ignore errors if user/group vars aren't set)
+} # end of write_monitoring_scripts_to_dir()
+
+###############################################################################
+# HOST CAPACITY MONITOR SCRIPT
+# Writes a host-capacity-monitor.sh that logs CPU/RAM utilization and
+# flags sustained high usage. Parameterized by target directory, base
+# path, log file, and state file.
+###############################################################################
+
+# write_host_capacity_monitor_to_dir(): writes the host-capacity-monitor.sh
+# script that periodically checks CPU/RAM and logs warnings when usage
+# stays above the high threshold for several consecutive checks.
+write_host_capacity_monitor_to_dir() { # define the write_host_capacity_monitor_to_dir function
+    local target_dir="$1" # first argument: where to write the script (e.g. /srv/gameservers/scripts)
+    local base_path="$2" # second argument: the install root (e.g. /srv/gameservers)
+    local log_file="$3" # third argument: path to the capacity log file
+    local state_file="$4" # fourth argument: path to the streak state file
+
+    cat > "${target_dir}/host-capacity-monitor.sh" << EOF # write the host capacity monitor script
+#!/usr/bin/env bash # use bash as the interpreter
+# host-capacity-monitor.sh - samples host CPU/RAM and warns on sustained high utilization
+set -uo pipefail # enable strict error handling
+LOG_FILE="${log_file}" # path to the capacity log file where samples are recorded
+STATE_FILE="${state_file}" # path to the streak state file tracking consecutive high readings
+HIGH_THRESHOLD=80 # CPU or RAM at/above this percent triggers the "high" counter
+LOW_THRESHOLD=40 # both CPU and RAM below this percent resets the streak to zero
+SUSTAINED_SAMPLES=3 # number of consecutive high readings before logging a warning
+ts() { date '+%Y-%m-%d %H:%M:%S'; } # helper: returns the current timestamp in standard format
+load1="\$(awk '{print \$1}' /proc/loadavg)" # read the 1-minute load average from the kernel
+cores="\$(nproc)" # count the number of CPU cores
+cpu_pct=\$(awk -v l="\$load1" -v c="\$cores" 'BEGIN{printf "%.0f", (l/c)*100}') # normalize load by core count to get a CPU usage percentage
+ram_pct=\$(awk '/MemTotal/{t=\$2} /MemAvailable/{a=\$2} END{ if (t>0) printf "%.0f", ((t-a)/t)*100; else print 0 }' /proc/meminfo) # calculate RAM usage as (total-available)/total percent
+mkdir -p "\$(dirname "\$STATE_FILE")" # ensure the state file's parent directory exists
+echo "\$(ts) CPU=\${cpu_pct}% RAM=\${ram_pct}% (load1=\${load1}, cores=\${cores})" >> "\$LOG_FILE" # append a sample line to the log
+streak=0 # default streak to zero (no consecutive high readings yet)
+[[ -f "\$STATE_FILE" ]] && streak="\$(cat "\$STATE_FILE" 2>/dev/null || echo 0)" # load the previous streak from the state file if it exists
+[[ "\$streak" =~ ^[0-9]+$ ]] || streak=0 # validate the streak is a number; reset to zero if corrupted
+if (( cpu_pct >= HIGH_THRESHOLD || ram_pct >= HIGH_THRESHOLD )); then # if EITHER resource is above the high threshold
+    streak=\$((streak + 1)) # increment the consecutive high-reading counter
+    echo "\$streak" > "\$STATE_FILE" # persist the new streak to disk
+    if (( streak >= SUSTAINED_SAMPLES )); then # if the streak has reached the warning threshold
+        echo "\$(ts) WARNING: sustained high utilization (CPU \${cpu_pct}%, RAM \${ram_pct}%) for \${streak} consecutive checks." >> "\$LOG_FILE" # log a warning
+    fi # end of the sustained-check warning
+elif (( cpu_pct < LOW_THRESHOLD && ram_pct < LOW_THRESHOLD )); then # if BOTH resources are below the low threshold
+    echo 0 > "\$STATE_FILE" # reset the streak to zero (system is cool again)
+fi # end of the utilization branching logic
+EOF
+
+    chmod 750 "${target_dir}/host-capacity-monitor.sh" # make the script executable by owner and group
+    chown "${user:-root}:${group:-root}" "${target_dir}/host-capacity-monitor.sh" 2>/dev/null || true # set ownership (ignore errors if user/group vars aren't set)
+} # end of write_host_capacity_monitor_to_dir()
+
+###############################################################################
+# INSTANCE REGISTRY LOCKING
+# Simple flock-based file locking for safe concurrent access to the
+# instance registry file. Prevents race conditions when multiple
+# installer processes try to add or remove instances simultaneously.
+###############################################################################
+
+# registry_lock(): acquires an exclusive file lock on the registry file.
+# Uses file descriptor 9 and flock with a 5-second timeout. Returns 1
+# (with an error message) if the lock cannot be acquired in time.
+registry_lock() { # define the registry_lock function
+    local registry="$1" # first argument: path to the registry file
+    local lockfile="${registry}.lock" # derive the lockfile path by appending .lock
+    exec 9>"$lockfile" # open file descriptor 9 for writing on the lockfile
+    flock -w 5 9 || { log_err "Could not acquire registry lock."; return 1; } # try to acquire an exclusive lock with a 5-second timeout; fail if it can't be obtained
+} # end of registry_lock()
+
+# registry_unlock(): releases the flock file lock and removes the lockfile.
+# Silently ignores errors (e.g. if the lock was already released or the
+# file doesn't exist).
+registry_unlock() { # define the registry_unlock function
+    local registry="$1" # first argument: path to the registry file
+    flock -u 9 2>/dev/null || true # release (unlock) file descriptor 9; suppress errors
+    rm -f "${registry}.lock" # delete the lockfile so the next caller starts fresh
+} # end of registry_unlock()
+
+###############################################################################
+# INSTANCE REGISTRY SAFE OPERATIONS
+# Wrappers around registry_add and registry_remove that acquire a file
+# lock before modifying the registry, preventing data corruption from
+# concurrent writes.
+###############################################################################
+
+# registry_add_safe(): thread-safe version of registry_add. Acquires a
+# lock, appends the entry, then releases the lock. The entry is appended
+# as-is (caller is responsible for the format).
+registry_add_safe() { # define the registry_add_safe function
+    local registry="$1" # first argument: path to the registry file
+    local entry="$2" # second argument: the full line to append (e.g. "name:game:port:timestamp")
+    registry_lock "$registry" || return 1 # acquire the lock; abort if we can't get it
+    echo "$entry" >> "$registry" # append the entry to the registry file
+    registry_unlock "$registry" # release the lock now that the write is done
+} # end of registry_add_safe()
+
+# registry_remove_safe(): thread-safe version of registry_remove. Acquires
+# a lock, removes the line matching the given instance name, then releases
+# the lock. Uses grep -v to filter out the matching line.
+registry_remove_safe() { # define the registry_remove_safe function
+    local registry="$1" # first argument: path to the registry file
+    local name="$2" # second argument: the instance name to remove (matched at the start of a line)
+    registry_lock "$registry" || return 1 # acquire the lock; abort if we can't get it
+    local tmp="${registry}.tmp" # temporary file for the filtered output
+    grep -v "^${name}:" "$registry" > "$tmp" 2>/dev/null || true # copy all lines EXCEPT the one matching this name; ignore grep's exit code
+    mv "$tmp" "$registry" # replace the registry with the filtered version
+    registry_unlock "$registry" # release the lock now that the edit is done
+} # end of registry_remove_safe()
+
+###############################################################################
+# FIREWALL (UFW) MANAGEMENT
+# Base UFW setup (SSH rate-limiting + activation) and per-instance
+# port-rule management, shared across all installer scripts.
 ###############################################################################
