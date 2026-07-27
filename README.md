@@ -1,6 +1,6 @@
 # landonkea-gameserver-scripts
 
-A production-grade game server management platform for Ubuntu/Debian Linux. Install, update, back up, monitor, and manage dedicated game servers from a single command-line interface.
+A production-grade game server management platform for Ubuntu Linux. Install, update, back up, monitor, and manage dedicated game servers from a single command-line interface.
 
 ## Supported Games (29 profiles)
 
@@ -12,7 +12,7 @@ Plus a standalone **Valheim** installer with extended backup/restore and status 
 
 ```
 install.sh                          # Entry point — detects which installer to run
-├── lib/common.sh                   # Shared library (34 functions: logging, validation, pre-flight checks)
+├── lib/common.sh                   # Shared library (54 functions: logging, validation, firewall, monitoring)
 ├── multi-game-platform/
 │   ├── install-game-server.sh      # Core multi-game installer (systemd, cron, backups, on-demand)
 │   ├── profiles/*.profile.sh       # 29 game-specific config files
@@ -25,6 +25,7 @@ install.sh                          # Entry point — detects which installer to
 ## Features
 
 - **Interactive & automatic modes** — runs with prompts for humans, or `-y` for scripts/CI
+- **Dry-run mode** — `--dry-run` previews what would happen without making changes
 - **Systemd integration** — each instance gets its own `gameserver@instancename.service`
 - **Automated backups** — per-instance cron jobs with configurable retention
 - **On-demand instances** — servers sleep when idle, wake on player connect (via sleep-listener)
@@ -52,7 +53,7 @@ sudo /srv/gameservers/scripts/healthcheck-instance.sh myinstance
 
 ## Requirements
 
-- Ubuntu 22.04+ or Debian 12+
+- Ubuntu 22.04+
 - Root access (auto-elevates via sudo)
 - ~2 GB free disk space minimum (varies by game)
 

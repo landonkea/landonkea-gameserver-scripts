@@ -29,11 +29,11 @@ Wine, or real hardware** — that requires an actual Ubuntu box, which
 wasn't available during development. If you're reviewing this, the
 highest-value things to check on a real disposable VM, roughly in order:
 
-1. **The four Wine-tier profiles** (`enshrouded`, `spaceengineers`,
-   `astroneer`, `arksurvivalascended`) — Wine is the most fragile part of
-   this whole platform by nature, and `astroneer.profile.sh` in
-   particular is flagged in its own header as the least-certain profile
-   here.
+1. **The six Wine-tier profiles** (`enshrouded`, `spaceengineers`,
+   `astroneer`, `arksurvivalascended`, `empyrion`, `vrising`) — Wine is
+   the most fragile part of this whole platform by nature, and
+   `astroneer.profile.sh` in particular is flagged in its own header as
+   the least-certain profile here.
 2. **Minecraft's RCON client** (`minecraft.profile.sh`'s `mc_rcon`
    function, and `teamfortress2.profile.sh`'s equivalent) — the wire
    protocol was verified against a hand-written test server during
@@ -72,6 +72,6 @@ bash -n profiles/yourgame.profile.sh          # syntax
   statement in a function — if `condition` can ever be false, this
   pattern makes the function return a failing exit code, which (under
   `set -e`, active throughout both scripts) can silently abort whoever
-  called it. Use `if [[ condition ]]; then action; fi` instead. This
-  exact bug was found and fixed in three profiles during development —
-  it's the single most likely subtle mistake to reintroduce here.
+  called it. Use `if [[ condition ]]; then action; fi` instead. Validators
+  are called inside `if` statements in `prompt_and_validate()`, so this
+  is safe there — but standalone functions should still avoid the pattern.
