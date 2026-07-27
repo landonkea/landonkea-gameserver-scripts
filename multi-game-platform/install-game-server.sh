@@ -141,8 +141,9 @@ readonly SYSTEMD_SLEEP_TEMPLATE_UNIT_PATH="/etc/systemd/system/gameserver-sleep@
 readonly CRON_IDLE_FILE="/etc/cron.d/gameserver-idle"
 readonly IDLE_MINUTES_THRESHOLD=5   # auto-save + auto-stop after this many consecutive idle minutes
 
-ASSUME_DEFAULTS=0
-ORIGINAL_ARGS_STRING=""
+ASSUME_DEFAULTS=0 # when set to 1 via -y/--yes, all prompts use defaults automatically
+DRY_RUN=0         # when set to 1 via --dry-run, add_instance shows what would happen without doing it
+ORIGINAL_ARGS_STRING="" # stores the raw CLI arguments so the error handler can suggest re-running
 
 ###############################################################################
 # Color/log setup is provided by the shared library (common.sh) sourced above.
@@ -549,27 +550,10 @@ install_profiles() {
 }
 
 ###############################################################################
-# STEAMCMD + PER-GAME "GOLDEN" INSTALL
+# install_steamcmd is provided by common.sh (sourced at the top of this
+# script). It downloads Valve's SteamCMD tarball, extracts it, and sets
+# ownership -- idempotent, safe to re-run.
 ###############################################################################
-
-# install_steamcmd: downloads/extracts Valve's SteamCMD tarball (skipped if
-# already present from a previous run).
-install_steamcmd() {
-    log_step "Installing SteamCMD"
-    if [[ -f "${STEAMCMD_DIR}/steamcmd.sh" ]]; then
-        log_info "SteamCMD already present at ${STEAMCMD_DIR}; skipping download."
-        return 0
-    fi
-    log_info "Downloading SteamCMD from Valve's CDN..."
-    curl_with_retry -fsSL "$STEAMCMD_URL" -o "${BASE_TMP_DIR}/steamcmd_linux.tar.gz" \
-        || die "Failed to download SteamCMD from ${STEAMCMD_URL}."
-    tar -xzf "${BASE_TMP_DIR}/steamcmd_linux.tar.gz" -C "$STEAMCMD_DIR" \
-        || die "Failed to extract the SteamCMD archive."
-    rm -f "${BASE_TMP_DIR}/steamcmd_linux.tar.gz"
-    chown -R "$GS_USER:$GS_GROUP" "$STEAMCMD_DIR"
-    [[ -f "${STEAMCMD_DIR}/steamcmd.sh" ]] || die "SteamCMD extraction did not produce steamcmd.sh as expected."
-    log_ok "SteamCMD installed at ${STEAMCMD_DIR}."
-}
 
 # install_or_update_golden: runs SteamCMD to install/validate the active
 # profile's App ID into its shared GOLDEN_DIR/<game_id> directory. Every
@@ -1386,6 +1370,59 @@ if [[ $EUID -ne 0 ]]; then log_err "Please run with sudo."; exit 1; fi
 target="${1:-}"
 [[ -n "$target" ]] || { echo "Usage: $0 <instance-name|all>"; list_instance_names_to_stderr; exit 1; }
 
+# validate_golden: runs SteamCMD validate (or custom download) for a game
+# exactly once. Uses an associative array to skip re-validation when
+# multiple instances share the same game. Returns 0 on success, 1 on
+# failure (after which the instance update is skipped).
+declare -A VALIDATED_GAMES
+
+validate_golden() {
+    local game_id="$1"
+    if [[ -n "${VALIDATED_GAMES[$game_id]:-}" ]]; then
+        log_info "Golden install for '${game_id}' already validated this run; skipping."
+        return 0
+    fi
+    local golden_dir="/srv/gameservers/golden/${game_id}"
+
+    # Load the game profile to get STEAM_APPID and platform info.
+    local profile_file="/srv/gameservers/scripts/profiles/${game_id}.profile.sh"
+    if [[ ! -f "$profile_file" ]]; then
+        log_err "Profile for '${game_id}' not found at ${profile_file}."
+        return 1
+    fi
+    # shellcheck source=/dev/null
+    source "$profile_file"
+
+    if [[ -z "${PROFILE_STEAM_APPID:-}" ]]; then
+        log_info "[${game_id}] Refreshing the shared golden install (direct download, not Steam)..."
+        if ! declare -F profile_custom_download >/dev/null || ! profile_custom_download "$golden_dir"; then
+            log_err "[${game_id}] Custom download failed during update."
+            return 1
+        fi
+    else
+        log_info "[${game_id}] Validating the shared golden install via SteamCMD (App ID ${PROFILE_STEAM_APPID})..."
+        local platform_flag=""
+        if [[ "${PROFILE_STEAM_PLATFORM:-linux}" == "windows" ]]; then
+            platform_flag="+@sSteamCmdForcePlatformType windows"
+        fi
+        local steamcmd_rc=0
+        runuser -u gameserver -- bash -c \
+            "\"${STEAMCMD_DIR}/steamcmd.sh\" ${platform_flag} +force_install_dir \"${golden_dir}\" +login anonymous +app_update ${PROFILE_STEAM_APPID} validate +quit" \
+            || steamcmd_rc=$?
+        log_info "[${game_id}] SteamCMD exited with code ${steamcmd_rc} (informational; verifying binary directly)."
+    fi
+
+    local found_binary
+    found_binary="$(profile_find_binary "$golden_dir")"
+    if [[ -z "$found_binary" || ! -e "$found_binary" ]]; then
+        log_err "[${game_id}] Golden server binary missing after validation!"
+        return 1
+    fi
+    log_ok "[${game_id}] Golden install verified."
+    VALIDATED_GAMES[$game_id]=1
+    return 0
+}
+
 # update_one: syncs one instance from the (already-validated) golden install and restarts it if it was running.
 update_one() {
     local name="$1"
@@ -1397,32 +1434,10 @@ update_one() {
         return 1
     fi
 
-    if [[ -z "${PROFILE_STEAM_APPID:-}" ]]; then
-        log_info "[$name] Refreshing the shared golden install for '${GAME}' (direct download, not Steam)..."
-        if ! declare -F profile_custom_download >/dev/null || ! profile_custom_download "$golden_dir"; then
-            log_err "[$name] Custom download failed during update."
-            return 1
-        fi
-    else
-        log_info "[$name] Validating the shared golden install for '${GAME}' via SteamCMD..."
-        local platform_flag=""
-        if [[ "${PROFILE_STEAM_PLATFORM:-linux}" == "windows" ]]; then
-            platform_flag="+@sSteamCmdForcePlatformType windows"
-        fi
-        local steamcmd_rc=0
-        runuser -u gameserver -- bash -c \
-            "\"${STEAMCMD_DIR}/steamcmd.sh\" ${platform_flag} +force_install_dir \"${golden_dir}\" +login anonymous +app_update ${PROFILE_STEAM_APPID} validate +quit" \
-            || steamcmd_rc=$?
-        log_info "[$name] SteamCMD exited with code ${steamcmd_rc} (informational; verifying binary directly)."
-    fi
-
-    local found_binary
-    found_binary="$(profile_find_binary "$golden_dir")"
-    if [[ -z "$found_binary" || ! -e "$found_binary" ]]; then
-        log_err "[$name] Golden server binary missing after update! Aborting before touching this instance."
+    # Validate this game's golden install (once per unique game, not per instance).
+    if ! validate_golden "$GAME"; then
         return 1
     fi
-    log_ok "[$name] Golden install verified."
 
     local was_active=0
     if systemctl is-active --quiet "gameserver@${name}"; then
@@ -1481,6 +1496,7 @@ EOF
 # <instance|all>. Verifies the service is active and its port is
 # listening; restarts automatically if run as root. A grace period avoids
 # false alarms while a game is still loading/generating a fresh world.
+# Also monitors the sleep-listener service for on-demand instances.
 write_healthcheck_script() {
     cat > "${SCRIPTS_DIR}/healthcheck-instance.sh" << 'EOF'
 #!/usr/bin/env bash
@@ -1496,6 +1512,26 @@ target="${1:-}"
 check_one() {
     local name="$1"
     load_instance "$name"
+
+    # For on-demand instances, check the sleep-listener service first.
+    # If the instance is supposed to be sleeping but the listener is down,
+    # that means new players can't wake it -- a silent failure.
+    if [[ "${ON_DEMAND:-0}" == "1" ]]; then
+        if ! systemctl is-active --quiet "gameserver@${name}"; then
+            # The real server should be stopped; verify the sleep listener is running.
+            if ! systemctl is-active --quiet "gameserver-sleep@${name}" 2>/dev/null; then
+                log_err "[$name] On-demand instance is not running AND sleep listener is down -- nobody can connect!"
+                if [[ $EUID -eq 0 ]]; then
+                    log_warn "[$name] Re-arming the sleep listener..."
+                    systemctl start "gameserver-sleep@${name}"
+                    notify_discord "Instance [$name] sleep listener was down on $(hostname) -- restarted automatically."
+                fi
+                return 1
+            fi
+            log_ok "[$name] On-demand sleep listener is active (instance is sleeping, waiting for connection)."
+            return 0
+        fi
+    fi
 
     if ! systemctl is-active --quiet "gameserver@${name}"; then
         log_err "[$name] Service is not active."
@@ -1826,7 +1862,7 @@ write_status_dashboard_script() {
 # status-dashboard.sh [instance-name] -- unified health-check dashboard
 set -uo pipefail
 source /srv/gameservers/scripts/common.sh
-REGISTRY="${GS_BASE}/instances/instances.registry"
+REGISTRY="${GS_BASE}/instances.registry"
 C_RESET=$'\033[0m'; C_RED=$'\033[1;31m'; C_GREEN=$'\033[1;32m'; C_YELLOW=$'\033[1;33m'; C_BOLD=$'\033[1m'
 [[ -f "$REGISTRY" ]] || { log_err "No instances registered."; exit 1; }
 host_uptime=$(uptime -p 2>/dev/null || uptime | sed 's/.*up /up /' | sed 's/,.*load.*//')
@@ -1982,43 +2018,10 @@ enable_and_start_instance_service() {
 }
 
 ###############################################################################
-# FIREWALL (UFW) -- driven by the active profile's profile_port_specs
+# configure_firewall_base and remove_firewall_for_instance are provided by
+# common.sh. configure_firewall_base takes the SSH port as its argument;
+# remove_firewall_for_instance takes the instance's base port.
 ###############################################################################
-
-# configure_firewall_base: one-time setup -- rate-limited SSH, and enables
-# UFW if it wasn't already active (asking first, never silently taking
-# over an already-managed firewall).
-configure_firewall_base() {
-    log_step "Configuring firewall (UFW) -- base rules"
-    local ssh_port=22
-    if [[ -r /etc/ssh/sshd_config ]]; then
-        local configured_ssh_port
-        configured_ssh_port="$(awk '/^[Pp]ort[ \t]+[0-9]+/{print $2; exit}' /etc/ssh/sshd_config || true)"
-        if [[ -n "$configured_ssh_port" ]]; then
-            ssh_port="$configured_ssh_port"
-        fi
-    fi
-    log_info "Allowing SSH on port ${ssh_port}/tcp (rate-limited against brute force)..."
-    ufw limit "${ssh_port}/tcp" comment 'SSH (rate-limited)' >>"$LOG_FILE" 2>&1
-
-    if ufw status | grep -q "Status: active"; then
-        log_ok "UFW is already active."
-    else
-        local enable_ufw="yes"
-        if [[ "$ASSUME_DEFAULTS" -ne 1 ]]; then
-            local reply=""
-            read -r -p "UFW is currently inactive. Enable it now to secure this server? [Y/n]: " reply < /dev/tty || true
-            reply="${reply:-y}"
-            [[ "$reply" =~ ^[Yy] ]] || enable_ufw="no"
-        fi
-        if [[ "$enable_ufw" == "yes" ]]; then
-            ufw --force enable >>"$LOG_FILE" 2>&1
-            log_ok "UFW enabled (SSH allowed)."
-        else
-            log_warn "Leaving UFW disabled at your request."
-        fi
-    fi
-}
 
 # configure_firewall_for_instance: opens every port this instance's game
 # profile declares via profile_port_specs (lines of "offset:protocol:desc").
@@ -2032,101 +2035,9 @@ configure_firewall_for_instance() {
     done < <(profile_port_specs)
 }
 
-# remove_firewall_for_instance: closes every port this instance's game
-# profile declared, given its base port (profile must already be loaded).
-remove_firewall_for_instance() {
-    local base_port="$1" offset proto desc port
-    while IFS=: read -r offset proto desc; do
-        [[ -n "$offset" ]] || continue
-        port=$(( base_port + offset ))
-        ufw delete allow "${port}/${proto}" >>"$LOG_FILE" 2>&1 || true
-    done < <(profile_port_specs)
-}
-
 ###############################################################################
-# FAIL2BAN (SSH brute-force protection) -- host-wide, game-agnostic
+# FAIL2BAN, LOG ROTATION, and JOURNALD CAP are provided by common.sh.
 ###############################################################################
-configure_fail2ban() {
-    log_step "Configuring fail2ban (SSH brute-force protection)"
-    local ssh_port=22
-    if [[ -r /etc/ssh/sshd_config ]]; then
-        local configured_ssh_port
-        configured_ssh_port="$(awk '/^[Pp]ort[ \t]+[0-9]+/{print $2; exit}' /etc/ssh/sshd_config || true)"
-        if [[ -n "$configured_ssh_port" ]]; then
-            ssh_port="$configured_ssh_port"
-        fi
-    fi
-    cat > "$FAIL2BAN_JAIL_LOCAL" << EOF
-# Managed by ${SCRIPT_NAME}.
-[DEFAULT]
-bantime.increment = true
-bantime.multipliers = 1 2 4 8 16 32 64
-bantime.maxtime = 1w
-bantime.rndtime = 30
-
-[sshd]
-enabled  = true
-port     = ${ssh_port}
-backend  = systemd
-maxretry = 5
-findtime = 10m
-bantime  = 1h
-EOF
-    chmod 644 "$FAIL2BAN_JAIL_LOCAL"
-    systemctl enable fail2ban >>"$LOG_FILE" 2>&1 || true
-    systemctl restart fail2ban >>"$LOG_FILE" 2>&1
-    if systemctl is-active --quiet fail2ban; then
-        log_ok "fail2ban is active, protecting SSH on port ${ssh_port}."
-    else
-        log_warn "fail2ban did not start correctly; check 'systemctl status fail2ban'."
-    fi
-}
-
-###############################################################################
-# LOG ROTATION + JOURNALD CAP -- host-wide
-###############################################################################
-configure_logrotate() {
-    log_step "Configuring log rotation"
-    cat > "$LOGROTATE_CONF" << EOF
-${INSTANCES_DIR}/*/logs/*.log {
-    weekly
-    rotate 8
-    compress
-    delaycompress
-    missingok
-    notifempty
-    copytruncate
-    create 0640 ${GS_USER} ${GS_GROUP}
-}
-EOF
-    chmod 644 "$LOGROTATE_CONF"
-    log_ok "Logrotate configured: weekly rotation, 8 weeks retained, compressed."
-}
-
-# configure_journald_limit: caps total systemd-journal disk usage, scaling
-# with fleet size (500MB floor + 150MB per registered shard, 8GB ceiling),
-# re-applying on every add so it keeps up as the fleet grows, while
-# preserving a hand-customized value (detected via a marker comment).
-configure_journald_limit() {
-    log_step "Sizing the systemd journal cap"
-    local marker="# Managed by ${SCRIPT_NAME} -- scales with instance count, see README"
-    local instance_count target_mb
-    instance_count="$(registry_list_names 2>/dev/null | grep -c . || true)"
-    [[ "$instance_count" =~ ^[0-9]+$ ]] || instance_count=0
-    target_mb=$(( JOURNALD_MAX_USE_FLOOR_MB + instance_count * JOURNALD_MAX_USE_PER_INSTANCE_MB ))
-    (( target_mb > JOURNALD_MAX_USE_CEILING_MB )) && target_mb=$JOURNALD_MAX_USE_CEILING_MB
-
-    if grep -qF "$marker" "$JOURNALD_CONF" 2>/dev/null; then
-        grep -vF -e "$marker" -e "SystemMaxUse=" "$JOURNALD_CONF" > "${JOURNALD_CONF}.tmp" 2>/dev/null || true
-        mv "${JOURNALD_CONF}.tmp" "$JOURNALD_CONF"
-    elif grep -q "^SystemMaxUse=" "$JOURNALD_CONF" 2>/dev/null; then
-        log_info "journald SystemMaxUse was customized by hand; leaving it as-is."
-        return 0
-    fi
-    { echo "$marker"; echo "SystemMaxUse=${target_mb}M"; } >> "$JOURNALD_CONF"
-    systemctl restart systemd-journald >>"$LOG_FILE" 2>&1 || true
-    log_ok "systemd journal capped at ${target_mb}M (${instance_count} shard(s) registered)."
-}
 
 ###############################################################################
 # CRON SCHEDULING
@@ -2229,6 +2140,41 @@ add_instance() {
 
     gather_generic_instance_input "$suggested_name"
 
+    # --- DRY RUN: show what WOULD happen, then stop ---
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+        local dry_name="${INSTANCE_NAME}"
+        local dry_port="${SERVER_PORT}"
+        local dry_on_demand="${ON_DEMAND}"
+        local dry_backup_dir="${BACKUP_DIR}"
+        local dry_game_id="${game_id}"
+        local avail_mb
+        avail_mb="$(df --output=avail -m /srv 2>/dev/null | tail -n1 | tr -d '[:space:]')"
+        echo
+        echo -e "${C_BOLD}========== DRY RUN -- nothing has been changed ==========${C_RESET}"
+        echo
+        echo "  Instance name:     ${dry_name}"
+        echo "  Game:              ${PROFILE_DISPLAY_NAME} (${dry_game_id})"
+        echo "  Base port:         ${dry_port}"
+        local dry_offset dry_proto dry_desc dry_p
+        while IFS=: read -r dry_offset dry_proto dry_desc; do
+            [[ -n "$dry_offset" ]] || continue
+            dry_p=$(( dry_port + dry_offset ))
+            echo "    - ${dry_p}/${dry_proto}  (${dry_desc})"
+        done < <(profile_port_specs)
+        echo "  On-demand:         $([ "$dry_on_demand" == "1" ] && echo "yes (sleep listener)" || echo "no (always running)")"
+        echo "  Firewall:          ufw allow for each port above"
+        echo "  Backup dir:        ${dry_backup_dir}"
+        echo "  Backup schedule:   daily at ${BACKUP_TIME}, ${BACKUP_RETENTION_DAYS}-day retention"
+        echo "  Update schedule:   daily at ${UPDATE_TIME}"
+        echo "  Disk available:    ${avail_mb:-unknown} MB on /srv"
+        echo
+        echo -e "${C_BOLD}To proceed for real, re-run without --dry-run:${C_RESET}"
+        echo "  ./${SCRIPT_NAME} --game ${game_id} --add-instance ${dry_name}"
+        echo
+        return 0
+    fi
+    # --- END DRY RUN ---
+
     create_instance_directories "$INSTANCE_NAME"
     # From this point on, a directory exists for this instance name but
     # it isn't registered yet -- if anything below fails, on_error can
@@ -2275,8 +2221,13 @@ remove_instance() {
     local port game_id
     port="$(registry_port_for "$name")"
     game_id="$(registry_game_for "$name")"
+    # Try to load the game profile so we know how to tear down firewall
+    # rules. If the profile is missing (e.g. it was deleted), log a
+    # warning but do NOT abort -- cleanup must still proceed.
     if [[ -n "$game_id" ]]; then
-        load_game_profile "$game_id"
+        if ! load_game_profile "$game_id" 2>/dev/null; then
+            log_warn "Game profile '${game_id}' for instance '${name}' is missing; firewall rules may need manual cleanup."
+        fi
     fi
 
     systemctl stop "gameserver@${name}" 2>>"$LOG_FILE" || true
@@ -2290,8 +2241,14 @@ remove_instance() {
     registry_remove "$name"
     log_ok "Service, firewall rules, and registry entry removed for '${name}'."
 
+    # In non-interactive mode, preserve data by default to avoid
+    # accidental deletion. In interactive mode, ask the user.
     local confirm=""
-    read -r -p "Also DELETE all data for '${name}' (world/save data, backups, logs)? Type 'yes' to confirm: " confirm < /dev/tty || true
+    if [[ "${ASSUME_DEFAULTS:-0}" -eq 1 ]]; then
+        log_info "Non-interactive mode: preserving data at $(instance_dir "$name")."
+    else
+        read -r -p "Also DELETE all data for '${name}' (world/save data, backups, logs)? Type 'yes' to confirm: " confirm < /dev/tty || true
+    fi
     if [[ "$confirm" == "yes" ]]; then
         rm -rf "$(instance_dir "$name")"
         log_ok "Removed $(instance_dir "$name")."
@@ -2427,8 +2384,18 @@ ensure_base_install() {
 
     install_systemd_template
     install_systemd_sleep_template
-    configure_firewall_base
-    configure_fail2ban
+
+    # Detect the SSH port to pass to the shared firewall setup function.
+    local ssh_port=22 # default SSH port
+    if [[ -r /etc/ssh/sshd_config ]]; then # if sshd_config is readable
+        local configured_ssh_port # declare variable for the detected port
+        configured_ssh_port="$(awk '/^[Pp]ort[ \t]+[0-9]+/{print $2; exit}' /etc/ssh/sshd_config || true)" # extract it
+        if [[ -n "$configured_ssh_port" ]]; then # if a custom port was found
+            ssh_port="$configured_ssh_port" # use the custom port
+        fi # end of the custom-port check
+    fi # end of the sshd_config check
+    configure_firewall_base "$ssh_port"
+    configure_fail2ban "$FAIL2BAN_JAIL_LOCAL" "$ssh_port"
     configure_logrotate
     configure_journald_limit
     schedule_cron_jobs
@@ -2515,6 +2482,9 @@ Options:
   --list-instances           List every configured shard, across all games.
   --list-games                List every available game profile.
   --uninstall                 Remove everything (asks before deleting data).
+  --status                    Show the health-check dashboard for all instances.
+  --dry-run                   Preview what add_instance WOULD do without doing it.
+  --version                   Print the script version and exit.
   -y, --yes                   Non-interactive: accept defaults / generate a
                                random password instead of prompting.
   -h, --help                  Show this help message and exit.
@@ -2635,12 +2605,16 @@ LIST_INSTANCES_MODE=0
 LIST_GAMES_MODE=0
 UNINSTALL_MODE=0
 CHECK_MODE=0
+STATUS_MODE=0
 
 # parse_args: interprets every CLI option above.
 parse_args() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
             -y|--yes) ASSUME_DEFAULTS=1 ;;
+            --dry-run) DRY_RUN=1 ;;
+            --version) echo "${SCRIPT_NAME} v${SCRIPT_VERSION}"; exit 0 ;;
+            --status) STATUS_MODE=1 ;;
             --game)
                 if [[ -z "${2:-}" || "${2:0:1}" == "-" ]]; then
                     echo "Error: --game requires a game id, e.g. --game terraria" >&2
@@ -2707,6 +2681,14 @@ main() {
             list_games
         fi
         return
+    fi
+
+    if [[ "$STATUS_MODE" -eq 1 ]]; then
+        if [[ -x "${SCRIPTS_DIR}/status-dashboard.sh" ]]; then
+            exec "${SCRIPTS_DIR}/status-dashboard.sh"
+        else
+            die "Status dashboard not found at ${SCRIPTS_DIR}/status-dashboard.sh. Run the installer first."
+        fi
     fi
 
     if [[ -n "$REMOVE_INSTANCE_NAME" ]]; then

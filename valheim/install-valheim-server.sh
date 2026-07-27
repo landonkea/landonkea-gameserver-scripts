@@ -383,25 +383,6 @@ create_base_directory_layout() {
 # STEAMCMD + SHARED "GOLDEN" VALHEIM SERVER INSTALL
 ###############################################################################
 
-# install_steamcmd: downloads/extracts Valve's SteamCMD tarball (skipped if
-# already present from a previous run).
-install_steamcmd() {
-    log_step "Installing SteamCMD"
-    if [[ -f "${STEAMCMD_DIR}/steamcmd.sh" ]]; then
-        log_info "SteamCMD already present at ${STEAMCMD_DIR}; skipping download."
-        return 0
-    fi
-    log_info "Downloading SteamCMD from Valve's CDN..."
-    curl -fsSL "$STEAMCMD_URL" -o "${BASE_TMP_DIR}/steamcmd_linux.tar.gz" \
-        || die "Failed to download SteamCMD from ${STEAMCMD_URL}."
-    tar -xzf "${BASE_TMP_DIR}/steamcmd_linux.tar.gz" -C "$STEAMCMD_DIR" \
-        || die "Failed to extract the SteamCMD archive."
-    rm -f "${BASE_TMP_DIR}/steamcmd_linux.tar.gz"
-    chown -R "$VALHEIM_USER:$VALHEIM_GROUP" "$STEAMCMD_DIR"
-    [[ -f "${STEAMCMD_DIR}/steamcmd.sh" ]] || die "SteamCMD extraction did not produce steamcmd.sh as expected."
-    log_ok "SteamCMD installed at ${STEAMCMD_DIR}."
-}
-
 # install_or_update_golden_server: runs SteamCMD to install/validate App ID
 # 896660 into the one shared GOLDEN_SERVER_DIR. Every instance's own server
 # copy is synced FROM this directory (see sync_instance_from_golden), so
@@ -565,11 +546,14 @@ configure_max_player_count() {
     fi
 
     log_info "[$name] Briefly starting the server once so BepInEx can generate its default config..."
+    # BepInEx can be slow to bootstrap on first launch (JIT compilation,
+    # plugin loading, config generation). 60 seconds is generous enough
+    # for even constrained VMs without waiting indefinitely.
     local probe_cmd probe_log="${BASE_TMP_DIR}/${name}-bepinex-probe.log"
     if [[ -n "$launcher" ]]; then
-        probe_cmd="cd '${server_dir}' && export SteamAppId=892970 && timeout 25 '${launcher}' -nographics -batchmode -name bepinexprobe -port 59999 -world probeworld -password Xk9mZq2Lp7 -savedir '${BASE_TMP_DIR}' -public 0"
+        probe_cmd="cd '${server_dir}' && export SteamAppId=892970 && timeout 60 '${launcher}' -nographics -batchmode -name bepinexprobe -port 59999 -world probeworld -password Xk9mZq2Lp7 -savedir '${BASE_TMP_DIR}' -public 0"
     else
-        probe_cmd="cd '${server_dir}' && export SteamAppId=892970 DOORSTOP_ENABLE=TRUE DOORSTOP_TARGET_ASSEMBLY='${server_dir}/BepInEx/core/BepInEx.Preloader.dll' LD_PRELOAD='${doorstop_lib}' && timeout 25 ./valheim_server.x86_64 -nographics -batchmode -name bepinexprobe -port 59999 -world probeworld -password Xk9mZq2Lp7 -savedir '${BASE_TMP_DIR}' -public 0"
+        probe_cmd="cd '${server_dir}' && export SteamAppId=892970 DOORSTOP_ENABLE=TRUE DOORSTOP_TARGET_ASSEMBLY='${server_dir}/BepInEx/core/BepInEx.Preloader.dll' LD_PRELOAD='${doorstop_lib}' && timeout 60 ./valheim_server.x86_64 -nographics -batchmode -name bepinexprobe -port 59999 -world probeworld -password Xk9mZq2Lp7 -savedir '${BASE_TMP_DIR}' -public 0"
     fi
 
     set +e
@@ -683,6 +667,14 @@ gather_instance_input() {
     prompt_and_validate "Daily backup time (24h HH:MM)" "03:00" validate_time_hhmm BACKUP_TIME 0
     prompt_and_validate "Daily update-check time (24h HH:MM)" "04:00" validate_time_hhmm UPDATE_TIME 0
 
+    # Warn if backup and update are scheduled for the same minute --
+    # both will fire simultaneously via cron, which can cause race
+    # conditions (update stops the service while backup tries to copy).
+    if [[ "$BACKUP_TIME" == "$UPDATE_TIME" ]]; then
+        log_warn "Backup time (${BACKUP_TIME}) and update time (${UPDATE_TIME}) are identical."
+        log_warn "This may cause conflicts since both run at the same minute."
+    fi
+
     prompt_and_validate "Sleep until a player connects, auto-stop after ${IDLE_MINUTES_THRESHOLD} idle minutes (saves resources when idle)? (yes/no)" \
         "yes" validate_yesno ON_DEMAND_INPUT 0
     ON_DEMAND="$(normalize_yesno_bit "$ON_DEMAND_INPUT")"
@@ -766,6 +758,23 @@ log_info() { echo -e "${C_BLUE}[INFO]${C_RESET} $(ts) $1"; }
 log_ok()   { echo -e "${C_GREEN}[ OK ]${C_RESET} $(ts) $1"; }
 log_warn() { echo -e "${C_YELLOW}[WARN]${C_RESET} $(ts) $1" >&2; }
 log_err()  { echo -e "${C_RED}[FAIL]${C_RESET} $(ts) $1" >&2; }
+
+# curl_with_retry: retries curl up to 3 times with a 5-second delay
+# between attempts. Handles transient network glitches during server
+# setup -- far better to retry silently than to abort over one failure.
+curl_with_retry() {
+    local attempt=1 max_attempts=3 delay_seconds=5
+    while (( attempt <= max_attempts )); do
+        if curl "$@"; then return 0; fi
+        if (( attempt < max_attempts )); then
+            log_warn "Network request failed (attempt ${attempt}/${max_attempts}); retrying in ${delay_seconds}s..."
+            sleep "$delay_seconds"
+        fi
+        attempt=$(( attempt + 1 ))
+    done
+    log_err "Network request failed after ${max_attempts} attempts: curl $*"
+    return 1
+}
 
 # The config file is 0600 (contains the password), readable only by root or
 # the 'valheim' user. Any other invoking user gets transparently
@@ -1670,7 +1679,9 @@ enable_and_start_instance_service() {
 
 # configure_firewall_base: one-time setup -- rate-limited SSH, and enables
 # UFW if it wasn't already active (asking first, never silently taking
-# over an already-managed firewall).
+# over an already-managed firewall). This is a Valheim-specific version
+# with rate-limiting and UFW enablement that the generic common.sh version
+# does not provide.
 configure_firewall_base() {
     log_step "Configuring firewall (UFW) -- base rules"
     local ssh_port=22
@@ -1712,18 +1723,13 @@ configure_firewall_for_instance() {
     ufw allow "${port3}/udp" comment "Valheim:${name}" >>"$LOG_FILE" 2>&1
 }
 
-# remove_firewall_for_instance: closes one instance's UDP block (used by
-# remove_instance).
-remove_firewall_for_instance() {
-    local port="$1" port2=$(($1+1)) port3=$(($1+2))
-    ufw delete allow "${port}/udp" >>"$LOG_FILE" 2>&1 || true
-    ufw delete allow "${port2}/udp" >>"$LOG_FILE" 2>&1 || true
-    ufw delete allow "${port3}/udp" >>"$LOG_FILE" 2>&1 || true
-}
-
 ###############################################################################
 # FAIL2BAN (SSH brute-force protection) -- unchanged from v1, host-wide
 ###############################################################################
+
+# configure_fail2ban: Valheim-specific version with progressive banning
+# (increasing ban durations on repeat offenders). The common.sh version
+# uses a different filter/config that may not be suitable.
 configure_fail2ban() {
     log_step "Configuring fail2ban (SSH brute-force protection)"
     local ssh_port=22
@@ -1761,6 +1767,10 @@ EOF
 ###############################################################################
 # LOG ROTATION + JOURNALD CAP -- host-wide, unchanged in spirit from v1
 ###############################################################################
+
+# configure_logrotate: Valheim-specific version that rotates all instance
+# logs via a glob pattern. The common.sh version only handles a single
+# file path, which is incompatible with multi-instance setups.
 configure_logrotate() {
     log_step "Configuring log rotation"
     cat > "$LOGROTATE_CONF" << EOF
@@ -1779,42 +1789,9 @@ EOF
     log_ok "Logrotate configured: weekly rotation, 8 weeks retained, compressed (applies to every instance)."
 }
 
-# configure_journald_limit: caps total systemd-journal disk usage so years
-# of logs across every instance can never silently fill the disk. The cap
-# SCALES with fleet size (a fixed 500MB floor plus 150MB per registered
-# shard, up to an 8GB ceiling) rather than using one arbitrary number
-# regardless of whether you're running 1 shard or 15 -- journald's
-# SystemMaxUse is a ceiling, not a pre-allocation, so a higher cap costs
-# nothing unless you actually generate that much log volume, and a bigger
-# fleet benefits from more retained troubleshooting history. A marker
-# comment distinguishes a value THIS script set (safe to grow as you add
-# shards) from one you customized by hand (always left alone).
-configure_journald_limit() {
-    log_step "Sizing the systemd journal cap"
-    local marker="# Managed by ${SCRIPT_NAME} -- scales with instance count, see README"
-    local instance_count target_mb
-
-    instance_count="$(registry_list_names 2>/dev/null | grep -c . || true)"
-    [[ "$instance_count" =~ ^[0-9]+$ ]] || instance_count=0
-    target_mb=$(( JOURNALD_MAX_USE_FLOOR_MB + instance_count * JOURNALD_MAX_USE_PER_INSTANCE_MB ))
-    (( target_mb > JOURNALD_MAX_USE_CEILING_MB )) && target_mb=$JOURNALD_MAX_USE_CEILING_MB
-
-    if grep -qF "$marker" "$JOURNALD_CONF" 2>/dev/null; then
-        # Our own previously-set value -- safe to replace as the fleet grows.
-        # grep -v legitimately exits 1 when it filters out every line (the
-        # expected outcome here), so the mv must not be gated on that exit
-        # code or the old value would never actually get replaced.
-        grep -vF -e "$marker" -e "SystemMaxUse=" "$JOURNALD_CONF" > "${JOURNALD_CONF}.tmp" 2>/dev/null || true
-        mv "${JOURNALD_CONF}.tmp" "$JOURNALD_CONF"
-    elif grep -q "^SystemMaxUse=" "$JOURNALD_CONF" 2>/dev/null; then
-        log_info "journald SystemMaxUse was customized by hand; leaving it as-is."
-        return 0
-    fi
-
-    { echo "$marker"; echo "SystemMaxUse=${target_mb}M"; } >> "$JOURNALD_CONF"
-    systemctl restart systemd-journald >>"$LOG_FILE" 2>&1 || true
-    log_ok "systemd journal capped at ${target_mb}M (${JOURNALD_MAX_USE_FLOOR_MB}M floor + ${JOURNALD_MAX_USE_PER_INSTANCE_MB}M x ${instance_count} shard(s), ${JOURNALD_MAX_USE_CEILING_MB}M ceiling)."
-}
+# configure_journald_limit is provided by common.sh. It takes
+# (journald_conf, max_use) -- we compute the value from instance count
+# and fleet-size constants, then pass it.
 
 ###############################################################################
 # CRON SCHEDULING -- one shared set of cron files that loop over every
@@ -1956,7 +1933,8 @@ add_instance() {
 
 # remove_instance: stops/disables one instance's service, removes its
 # firewall rules and registry entry, then asks (separately) whether to
-# also delete its data (world/backups/logs).
+# also delete its data (world/backups/logs). Always cleans up firewall
+# and registry even if the port lookup fails (best-effort cleanup).
 remove_instance() {
     local name="$1"
     registry_has "$name" || die "No instance named '${name}' is registered. Use --list-instances to see what exists."
@@ -1970,10 +1948,19 @@ remove_instance() {
     systemctl disable "valheim-sleep@${name}" 2>>"$LOG_FILE" || true
 
     if [[ -n "$port" ]]; then
-        remove_firewall_for_instance "$port"
+        remove_firewall_for_instance "$name" "$port"
+    else
+        log_warn "Could not look up port for '${name}'; firewall rules may need manual cleanup."
     fi
     registry_remove "$name"
     log_ok "Service, firewall rules, and registry entry removed for '${name}'."
+
+    # In non-interactive mode (-y), skip the data deletion prompt entirely
+    # to avoid hanging. Data is preserved by default (safe choice).
+    if [[ "$ASSUME_DEFAULTS" -eq 1 ]]; then
+        log_info "Non-interactive mode: preserving data at $(instance_dir "$name")."
+        return 0
+    fi
 
     local confirm=""
     read -r -p "Also DELETE all data for '${name}' (world, backups, logs)? Type 'yes' to confirm: " confirm < /dev/tty || true
@@ -2282,8 +2269,11 @@ print_instance_summary() {
     echo
     echo "  Server name:     ${SERVER_NAME}"
     echo "  World name:      ${WORLD_NAME}"
-    echo "  LAN IP:          ${LAN_IP}:${SERVER_PORT}   (for players on this local network)"
-    [[ -n "${PUBLIC_IP:-}" ]] && echo "  Public IP:       ${PUBLIC_IP}:${SERVER_PORT}   (for remote players -- requires port forwarding, see below)"
+    echo "  Ports:           ${SERVER_PORT}/udp (game query)"
+    echo "                   ${port2}/udp     (Steam master)"
+    echo "                   ${port3}/udp     (Steam P2P)"
+    echo "  LAN IP:          ${LAN_IP}   (for players on this local network)"
+    [[ -n "${PUBLIC_IP:-}" ]] && echo "  Public IP:       ${PUBLIC_IP}   (for remote players -- requires port forwarding, see below)"
     echo "  Max players:     ${MAX_PLAYERS} $( [[ "${BEPINEX_ENABLED:-0}" == "1" ]] && echo "(BepInEx + MaxPlayerCount)" || echo "(vanilla)" )"
     echo "  Crossplay:       $( [[ "$CROSSPLAY" == "1" ]] && echo enabled || echo disabled )"
     echo "  Visibility:      PRIVATE -- not listed in any Steam/in-game server browser"
@@ -2303,8 +2293,11 @@ print_instance_summary() {
     echo "  Then in Valheim: Join Game -> Favorites."
     if [[ -n "${PUBLIC_IP:-}" ]]; then
         echo
-        echo "  For remote players to reach this shard, forward UDP ports"
-        echo "  ${SERVER_PORT}-${port3} to ${LAN_IP} on your router."
+        echo "  For remote players to reach this shard, forward these UDP ports"
+        echo "  to ${LAN_IP} on your router:"
+        echo "    ${SERVER_PORT}/udp  (game query)"
+        echo "    ${port2}/udp        (Steam master)"
+        echo "    ${port3}/udp        (Steam P2P)"
     fi
     echo
     echo -e "${C_BOLD}Manage this instance:${C_RESET}"
@@ -2344,7 +2337,7 @@ ensure_base_install() {
     create_valheim_user
     create_base_directory_layout
 
-    install_steamcmd
+    install_steamcmd "$STEAMCMD_DIR" "$BASE_TMP_DIR"
     install_or_update_golden_server
 
     write_all_helper_scripts
@@ -2355,7 +2348,14 @@ ensure_base_install() {
     configure_firewall_base
     configure_fail2ban
     configure_logrotate
-    configure_journald_limit
+    # Compute the journal cap from instance count and fleet-size constants,
+    # then call common.sh's configure_journald_limit(journald_conf, max_use)
+    local instance_count target_mb
+    instance_count="$(registry_list_names 2>/dev/null | grep -c . || true)"
+    [[ "$instance_count" =~ ^[0-9]+$ ]] || instance_count=0
+    target_mb=$(( JOURNALD_MAX_USE_FLOOR_MB + instance_count * JOURNALD_MAX_USE_PER_INSTANCE_MB ))
+    (( target_mb > JOURNALD_MAX_USE_CEILING_MB )) && target_mb=$JOURNALD_MAX_USE_CEILING_MB
+    configure_journald_limit "$JOURNALD_CONF" "${target_mb}M"
     schedule_cron_jobs
 
     gather_network_info
@@ -2383,7 +2383,7 @@ uninstall_everything() {
         systemctl disable "valheim@${name}" 2>>"$LOG_FILE" || true
         systemctl stop "valheim-sleep@${name}" 2>>"$LOG_FILE" || true
         systemctl disable "valheim-sleep@${name}" 2>>"$LOG_FILE" || true
-        [[ -n "$port" ]] && remove_firewall_for_instance "$port"
+        [[ -n "$port" ]] && remove_firewall_for_instance "$name" "$port"
     done < "$INSTANCE_REGISTRY"
 
     rm -f "$SYSTEMD_TEMPLATE_UNIT_PATH" "$SYSTEMD_SLEEP_TEMPLATE_UNIT_PATH"
@@ -2434,7 +2434,9 @@ Options:
   --add-instance <name>     Add another shard (prompts for its settings).
   --remove-instance <name>  Stop and remove one shard (asks before deleting data).
   --list-instances          List every configured shard.
+  --status [name]           Show live status for one or all instances.
   --uninstall               Remove everything (asks before deleting data).
+  --version                 Show the installer version and exit.
   -y, --yes                 Non-interactive: accept defaults / generate a
                              random password instead of prompting.
   -h, --help                Show this help message and exit.
@@ -2519,6 +2521,8 @@ run_environment_check() {
 ADD_INSTANCE_NAME=""
 REMOVE_INSTANCE_NAME=""
 LIST_INSTANCES_MODE=0
+STATUS_MODE=0
+STATUS_INSTANCE_NAME=""
 UNINSTALL_MODE=0
 CHECK_MODE=0
 ADD_INSTANCE_MODE=0
@@ -2544,8 +2548,17 @@ parse_args() {
                 shift
                 ;;
             --list-instances) LIST_INSTANCES_MODE=1 ;;
+            --status)
+                STATUS_MODE=1
+                # --status optionally takes an instance name as the next argument
+                if [[ -n "${2:-}" && "${2:0:1}" != "-" ]]; then
+                    STATUS_INSTANCE_NAME="$2"
+                    shift
+                fi
+                ;;
             --uninstall) UNINSTALL_MODE=1 ;;
             --check) CHECK_MODE=1 ;;
+            --version) echo "install-valheim-server.sh v${SCRIPT_VERSION}"; exit 0 ;;
             -h|--help) print_usage; exit 0 ;;
             *) echo "Unknown option: $1" >&2; print_usage; exit 1 ;;
         esac
@@ -2573,6 +2586,17 @@ main() {
 
     if [[ "$LIST_INSTANCES_MODE" -eq 1 ]]; then
         list_instances
+        return
+    fi
+
+    if [[ "$STATUS_MODE" -eq 1 ]]; then
+        local status_script="${SCRIPTS_DIR}/status-valheim.sh"
+        if [[ -x "$status_script" ]]; then
+            # Pass the instance name if one was given, otherwise show all
+            "$status_script" ${STATUS_INSTANCE_NAME:+"$STATUS_INSTANCE_NAME"}
+        else
+            die "Status script not found at ${status_script}. Run the installer first."
+        fi
         return
     fi
 
