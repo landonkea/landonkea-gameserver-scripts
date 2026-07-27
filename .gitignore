@@ -1,0 +1,14 @@
+# --- Ignore compiled/optimized Python files ---
+__pycache__/
+*.py[cod]
+*$py.class
+
+# --- Ignore editor and OS junk ---
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# --- Ignore logs that may accumulate during testing ---
+*.log

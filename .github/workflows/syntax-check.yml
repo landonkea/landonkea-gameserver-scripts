@@ -1,0 +1,66 @@
+name: Syntax check
+
+# Runs automatically on every push and every pull request, so a broken
+# script can never get merged without at least this most basic check
+# having passed first.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  bash-syntax-check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Syntax-check every .sh file
+        run: |
+          # Find every file ending in .sh anywhere in the repository, and
+          # run "bash -n" on each one -- this asks bash to READ the file
+          # and confirm it's grammatically valid, WITHOUT actually
+          # running any of it (no real commands execute, nothing is
+          # installed, nothing on the runner is changed). This is
+          # intentionally the same command used throughout local
+          # development for this project.
+          status=0
+          while IFS= read -r -d '' file; do
+            echo "Checking: $file"
+            if ! bash -n "$file"; then
+              echo "::error file=$file::Syntax error detected"
+              status=1
+            fi
+          done < <(find . -type f -name "*.sh" -print0)
+          exit $status
+
+      - name: Confirm every profile satisfies the platform's contract
+        run: |
+          # This goes a step further than plain syntax checking: it
+          # actually loads the real platform script's functions (without
+          # running its "main" installer logic -- see the "if
+          # BASH_SOURCE... == 0" guard at the very bottom of
+          # install-game-server.sh, which is exactly what allows this)
+          # and calls load_game_profile on every single profile file,
+          # which checks that each one defines every variable and
+          # function the platform requires. A profile missing something
+          # required fails loudly here, in an automated check, rather
+          # than being discovered later by a person running it for real.
+          cd multi-game-platform
+          sed 's/^readonly //' install-game-server.sh > /tmp/ci-check.sh
+          bash << 'EOF'
+          source /tmp/ci-check.sh
+          trap - ERR
+          PROFILES_DIR="$(pwd)/profiles"
+          fail=0
+          for g in $(list_available_games); do
+            if load_game_profile "$g" 2>/tmp/ci-err.txt; then
+              echo "OK: $g"
+            else
+              echo "FAIL: $g -- $(cat /tmp/ci-err.txt)"
+              fail=1
+            fi
+          done
+          exit $fail
+          EOF
