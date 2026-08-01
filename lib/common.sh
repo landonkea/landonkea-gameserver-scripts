@@ -1161,9 +1161,3 @@ registry_remove_safe() { # define the registry_remove_safe function
     mv "$tmp" "$registry" # replace the registry with the filtered version
     registry_unlock "$registry" # release the lock now that the edit is done
 } # end of registry_remove_safe()
-
-###############################################################################
-# FIREWALL (UFW) MANAGEMENT
-# Base UFW setup (SSH rate-limiting + activation) and per-instance
-# port-rule management, shared across all installer scripts.
-###############################################################################

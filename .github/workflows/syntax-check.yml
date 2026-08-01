@@ -35,6 +35,38 @@ jobs:
           done < <(find . -type f -name "*.sh" -print0)
           exit $status
 
+      - name: ShellCheck (fails only on genuine errors)
+        run: |
+          # ShellCheck static-analyzes every script for real bugs (unquoted
+          # expansions that break on spaces, unreachable code, etc.), not
+          # just grammar. "-s bash" tells it every file here is bash even
+          # though the profiles/ and lib/ files have no shebang of their
+          # own (they're meant to be sourced, never run directly).
+          #
+          # Severity is deliberately capped to "error" as the pass/fail
+          # gate: this codebase's own architecture (config variables a
+          # profile sets but never reads itself -- the core installer
+          # reads them after sourcing the profile; a validator pattern
+          # explicitly reviewed and accepted in CONTRIBUTING.md; etc.)
+          # trips ShellCheck's "warning"/"info"/"style" checks in ways
+          # that are known false positives here, not real bugs. Gating on
+          # "error" keeps this check meaningful (still fails a PR that
+          # introduces a genuine ShellCheck-detectable bug) without
+          # requiring every future contributor to litter the codebase
+          # with per-line disable comments to keep CI green.
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          find . -type f -name "*.sh" -print0 | xargs -0 shellcheck -s bash -S error
+
+      - name: ShellCheck (informational -- warnings/style, does not fail the build)
+        if: always()
+        run: |
+          # Same scan, but at the default severity, and never fails the
+          # job -- this surfaces lower-severity findings (unused-looking
+          # variables, quoting suggestions, etc.) in the workflow log for
+          # a human to skim, without blocking anyone's PR over them.
+          sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+          find . -type f -name "*.sh" -print0 | xargs -0 shellcheck -s bash || true
+
       - name: Confirm every profile satisfies the platform's contract
         run: |
           # This goes a step further than plain syntax checking: it

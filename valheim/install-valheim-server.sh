@@ -549,11 +549,19 @@ configure_max_player_count() {
     # BepInEx can be slow to bootstrap on first launch (JIT compilation,
     # plugin loading, config generation). 60 seconds is generous enough
     # for even constrained VMs without waiting indefinitely.
+    # A fixed literal password here would be a hardcoded credential-shaped
+    # string sitting in source control -- harmless in practice (the probe
+    # binds to an unused port never opened in the firewall and is torn
+    # down within seconds), but a throwaway random one costs nothing and
+    # avoids that pattern entirely, matching how every other
+    # auto-generated password in this codebase is produced.
+    local probe_password
+    probe_password="$(tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 16 || true)"
     local probe_cmd probe_log="${BASE_TMP_DIR}/${name}-bepinex-probe.log"
     if [[ -n "$launcher" ]]; then
-        probe_cmd="cd '${server_dir}' && export SteamAppId=892970 && timeout 60 '${launcher}' -nographics -batchmode -name bepinexprobe -port 59999 -world probeworld -password Xk9mZq2Lp7 -savedir '${BASE_TMP_DIR}' -public 0"
+        probe_cmd="cd '${server_dir}' && export SteamAppId=892970 && timeout 60 '${launcher}' -nographics -batchmode -name bepinexprobe -port 59999 -world probeworld -password ${probe_password} -savedir '${BASE_TMP_DIR}' -public 0"
     else
-        probe_cmd="cd '${server_dir}' && export SteamAppId=892970 DOORSTOP_ENABLE=TRUE DOORSTOP_TARGET_ASSEMBLY='${server_dir}/BepInEx/core/BepInEx.Preloader.dll' LD_PRELOAD='${doorstop_lib}' && timeout 60 ./valheim_server.x86_64 -nographics -batchmode -name bepinexprobe -port 59999 -world probeworld -password Xk9mZq2Lp7 -savedir '${BASE_TMP_DIR}' -public 0"
+        probe_cmd="cd '${server_dir}' && export SteamAppId=892970 DOORSTOP_ENABLE=TRUE DOORSTOP_TARGET_ASSEMBLY='${server_dir}/BepInEx/core/BepInEx.Preloader.dll' LD_PRELOAD='${doorstop_lib}' && timeout 60 ./valheim_server.x86_64 -nographics -batchmode -name bepinexprobe -port 59999 -world probeworld -password ${probe_password} -savedir '${BASE_TMP_DIR}' -public 0"
     fi
 
     set +e
@@ -934,7 +942,10 @@ INSTANCE_DIR="/srv/valheim/instances/${1:?instance name required}"
 chown -R "${VALHEIM_USER}:${VALHEIM_GROUP}" \
     "${INSTANCE_DIR}/world" "${INSTANCE_DIR}/logs" "${INSTANCE_DIR}/tmp" "${INSTANCE_DIR}/server"
 chmod 750 "${INSTANCE_DIR}/world" "${INSTANCE_DIR}/logs"
-[[ -f "${INSTANCE_DIR}/config.env" ]] && chmod 600 "${INSTANCE_DIR}/config.env" && chown "${VALHEIM_USER}:${VALHEIM_GROUP}" "${INSTANCE_DIR}/config.env"
+if [[ -f "${INSTANCE_DIR}/config.env" ]]; then
+    chmod 600 "${INSTANCE_DIR}/config.env"
+    chown "${VALHEIM_USER}:${VALHEIM_GROUP}" "${INSTANCE_DIR}/config.env"
+fi
 exit 0
 EOF
     chmod 700 "${SCRIPTS_DIR}/fix-permissions.sh"
@@ -1937,6 +1948,15 @@ add_instance() {
 # and registry even if the port lookup fails (best-effort cleanup).
 remove_instance() {
     local name="$1"
+    # Validate before this name is used inside grep/sed patterns in the
+    # registry_* helpers below -- an unvalidated --remove-instance value
+    # (this function's only caller besides the validated interactive path)
+    # could otherwise contain regex metacharacters. A name like ".*" would
+    # make registry_has() match any line (bypassing the "no such instance"
+    # error right below) and make registry_remove()'s sed delete every
+    # line in instances.registry, wiping the whole fleet's bookkeeping.
+    validate_instance_name "$name" >/dev/null \
+        || die "Instance name '${name}' is invalid: letters, numbers, '_', '-' only, 1-32 characters."
     registry_has "$name" || die "No instance named '${name}' is registered. Use --list-instances to see what exists."
 
     log_step "Removing instance '${name}'"
@@ -2383,7 +2403,9 @@ uninstall_everything() {
         systemctl disable "valheim@${name}" 2>>"$LOG_FILE" || true
         systemctl stop "valheim-sleep@${name}" 2>>"$LOG_FILE" || true
         systemctl disable "valheim-sleep@${name}" 2>>"$LOG_FILE" || true
-        [[ -n "$port" ]] && remove_firewall_for_instance "$name" "$port"
+        if [[ -n "$port" ]]; then
+            remove_firewall_for_instance "$name" "$port"
+        fi
     done < "$INSTANCE_REGISTRY"
 
     rm -f "$SYSTEMD_TEMPLATE_UNIT_PATH" "$SYSTEMD_SLEEP_TEMPLATE_UNIT_PATH"
@@ -2525,7 +2547,6 @@ STATUS_MODE=0
 STATUS_INSTANCE_NAME=""
 UNINSTALL_MODE=0
 CHECK_MODE=0
-ADD_INSTANCE_MODE=0
 
 # parse_args: interprets every CLI option above.
 parse_args() {
@@ -2533,7 +2554,11 @@ parse_args() {
         case "$1" in
             -y|--yes) ASSUME_DEFAULTS=1 ;;
             --add-instance)
-                ADD_INSTANCE_MODE=1
+                # --add-instance <name> is documented as required to add a
+                # shard, but --game <game> alone (no --add-instance at all)
+                # is also accepted and behaves identically -- the flag here
+                # only exists to optionally capture the instance NAME that
+                # follows it, not to gate whether an instance gets added.
                 if [[ -n "${2:-}" && "${2:0:1}" != "-" ]]; then
                     ADD_INSTANCE_NAME="$2"
                     shift

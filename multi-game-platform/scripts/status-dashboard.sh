@@ -65,17 +65,6 @@ DISK_CRIT_PCT=90              # disk usage above this % gets red (critical)
 HOSTNAME="$(hostname)"        # get the machine's hostname for the header
 
 ###############################################################################
-# HELPER: colorize()
-# Wraps text in the given ANSI color code. If the color code is empty (piped
-# output), returns the text unchanged. This keeps color logic clean and safe.
-###############################################################################
-colorize() { # define the colorize function
-    local color="$1"  # first argument: the ANSI color code to use
-    local text="$2"   # second argument: the text to wrap in color
-    printf '%s%s%s' "$color" "$text" "$CLR_RESET"  # print: color + text + reset
-} # end of colorize()
-
-###############################################################################
 # HELPER: format_uptime()
 # Converts a number of seconds into a human-readable "Xd Xh Xm" string.
 # Handles days, hours, and minutes. Seconds under 60 show as "<1m".
@@ -228,7 +217,7 @@ SS_OUTPUT=$(ss -uln 2>/dev/null; ss -tln 2>/dev/null) # UDP + TCP listening sock
 #   3. Uptime from the systemd ActiveEnterTimestamp property
 #   4. Disk usage via du -sh on the instance directory
 ###############################################################################
-while IFS=: read -r reg_name reg_game reg_port reg_created; do # read registry fields
+while IFS=: read -r reg_name reg_game reg_port _; do # read registry fields (4th field, creation time, isn't used here)
 
     # Skip empty lines (trailing newlines, blank entries)
     [[ -n "$reg_name" ]] || continue  # if name is empty, skip to next line
@@ -305,7 +294,7 @@ while IFS=: read -r reg_name reg_game reg_port reg_created; do # read registry f
     DISK_USAGE_CLEAN=$(echo "$DISK_USAGE" | tr -d '[:space:]') # strip whitespace for comparison
     case "$DISK_USAGE_CLEAN" in # pattern match on the disk usage string
         *G) # usage is in gigabytes
-            DISK_NUM=$(echo "$DISK_USAGE_CLEAN" | sed 's/G//') # extract the numeric part
+            DISK_NUM="${DISK_USAGE_CLEAN%G}" # extract the numeric part (strip trailing "G")
             if [[ "$DISK_NUM" =~ ^[0-9]+$ ]] && [[ "$DISK_NUM" -ge 10 ]]; then # 10GB or more
                 INST_DISK_COLOR="$CLR_RED"    # red = critical: very large instance
             elif [[ "$DISK_NUM" =~ ^[0-9]+$ ]] && [[ "$DISK_NUM" -ge 5 ]]; then # 5GB or more
