@@ -405,13 +405,10 @@ load_game_profile() {
 ###############################################################################
 # PACKAGE INSTALLATION
 ###############################################################################
-readonly CORE_PACKAGES=(
-    curl wget unzip jq rsync zip tar cron ufw fail2ban socat conntrack
-    ca-certificates software-properties-common
-)
-readonly OPTIONAL_PACKAGES=(
-    git nano vim htop btop tmux screen lm-sensors smartmontools
-)
+# CORE_PACKAGES and OPTIONAL_PACKAGES are provided by common.sh (sourced at
+# the top of this script) -- deliberately not redeclared here, so there is
+# exactly one place that lists them and the two can never silently drift
+# out of sync with each other.
 # Only installed on demand, the first time an instance of a Wine-requiring
 # game (profile PROFILE_REQUIRES_WINE=1) is added -- most users running
 # only native-Linux games never need any of this.
@@ -2026,7 +2023,7 @@ enable_and_start_instance_service() {
 # configure_firewall_for_instance: opens every port this instance's game
 # profile declares via profile_port_specs (lines of "offset:protocol:desc").
 configure_firewall_for_instance() {
-    local name="$1" base_port="$2" spec offset proto desc port
+    local name="$1" base_port="$2" offset proto desc port
     while IFS=: read -r offset proto desc; do
         [[ -n "$offset" ]] || continue
         port=$(( base_port + offset ))
@@ -2215,6 +2212,14 @@ add_instance() {
 # also delete its data.
 remove_instance() {
     local name="$1"
+    # Validate before this name is used inside grep/sed patterns in the
+    # registry_* helpers below -- an unvalidated --remove-instance value
+    # could otherwise contain regex metacharacters. A name like ".*" would
+    # make registry_has() match any line (bypassing the "no such instance"
+    # error right below) and make registry_remove()'s sed delete every
+    # line in instances.registry, wiping the whole fleet's bookkeeping.
+    validate_instance_name "$name" >/dev/null \
+        || die "Instance name '${name}' is invalid: letters, numbers, '_', '-' only, 1-32 characters."
     registry_has "$name" || die "No instance named '${name}' is registered. Use --list-instances to see what exists."
 
     log_step "Removing instance '${name}'"
@@ -2599,7 +2604,6 @@ run_environment_check() {
 
 GAME_ID=""
 ADD_INSTANCE_NAME=""
-ADD_INSTANCE_MODE=0
 REMOVE_INSTANCE_NAME=""
 LIST_INSTANCES_MODE=0
 LIST_GAMES_MODE=0
@@ -2623,7 +2627,11 @@ parse_args() {
                 GAME_ID="$2"; shift
                 ;;
             --add-instance)
-                ADD_INSTANCE_MODE=1
+                # --add-instance <name> is documented as required to add a
+                # shard, but --game <game> alone (no --add-instance at all)
+                # is also accepted and behaves identically -- the flag here
+                # only exists to optionally capture the instance NAME that
+                # follows it, not to gate whether an instance gets added.
                 if [[ -n "${2:-}" && "${2:0:1}" != "-" ]]; then
                     ADD_INSTANCE_NAME="$2"; shift
                 fi
