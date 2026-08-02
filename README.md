@@ -51,6 +51,34 @@ sudo /srv/gameservers/scripts/status-dashboard.sh
 sudo /srv/gameservers/scripts/healthcheck-instance.sh myinstance
 ```
 
+## Discord Notifications (optional)
+
+Every instance can optionally send Discord alerts when something goes wrong:
+a crashed server getting auto-restarted, a failed backup, a backup skipped
+because the backup disk is nearly full, or a failed post-update restart.
+This is entirely optional -- if you never configure it, nothing changes;
+the tool works exactly the same either way.
+
+**Setup:**
+
+1. In Discord, go to the target channel's Settings → Integrations →
+   Webhooks → New Webhook, and copy its URL. It looks like:
+   `https://discord.com/api/webhooks/123456789/abcDEF...`
+2. When the installer prompts `Discord webhook URL for crash/backup-failure
+   alerts (blank to disable)`, paste it in. Leave it blank to skip.
+3. To add, change, or remove it after an instance already exists, edit
+   `DISCORD_WEBHOOK_URL="..."` in that instance's config file:
+   `/srv/gameservers/instances/<name>/config.env` (or
+   `/srv/valheim/instances/<name>/config.env` for the standalone Valheim
+   installer). No restart is needed -- every backup/update/health-check
+   script reads config.env fresh each time it runs, so the change takes
+   effect on the very next run.
+
+The webhook URL is per-instance (not a single global setting), stored in
+that instance's `config.env` alongside its other settings -- the same file
+already used for the server password and backup schedule, and it's
+`chmod 600` for the same reason: only root can read it.
+
 ## Requirements
 
 - Ubuntu 22.04+

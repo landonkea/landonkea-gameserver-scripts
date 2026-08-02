@@ -458,6 +458,26 @@ validate_backup_dir() {
     return 0
 }
 
+# validate_discord_webhook_url: this field is entirely optional -- an empty
+# value is always valid and simply leaves Discord notifications disabled
+# for this instance (see notify_discord() below). If the user DOES supply
+# a value, it must look like a real Discord webhook URL so a typo doesn't
+# silently fail every notification later; Discord webhook URLs always
+# start with this exact prefix.
+validate_discord_webhook_url() {
+    local v="$1"
+    [[ -z "$v" ]] && return 0 # blank -- notifications stay disabled; nothing to validate
+    if has_forbidden_chars "$v"; then
+        echo "May not contain: \" ' \` \\ \$"
+        return 1
+    fi
+    if [[ "$v" != https://discord.com/api/webhooks/* ]]; then
+        echo "Must be a Discord webhook URL (https://discord.com/api/webhooks/...), or blank to disable notifications."
+        return 1
+    fi
+    return 0
+}
+
 ###############################################################################
 # GENERIC PROMPT ENGINE
 ###############################################################################
@@ -914,7 +934,12 @@ gather_generic_instance_input() {
     if [[ "$BACKUP_TIME" == "$UPDATE_TIME" ]]; then
         log_warn "Backup and update times are identical (${BACKUP_TIME}); they will run back-to-back."
     fi
-    DISCORD_WEBHOOK_URL=""
+
+    # Discord notifications are entirely optional -- leaving this blank
+    # (the default) disables them completely; notify_discord() below just
+    # no-ops in that case. See README.md for how to create a webhook URL.
+    prompt_and_validate "Discord webhook URL for crash/backup-failure alerts (blank to disable)" \
+        "" validate_discord_webhook_url DISCORD_WEBHOOK_URL 0
     log_ok "Configuration collected for instance '${INSTANCE_NAME}'."
 }
 
