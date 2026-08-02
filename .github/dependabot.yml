@@ -1,0 +1,40 @@
+# WHAT IS THIS FILE?
+# This is Dependabot's configuration file. Dependabot is a GitHub feature
+# that automatically checks whether your project's dependencies (gems,
+# npm packages, GitHub Actions, etc.) have newer versions available, and
+# opens pull requests to bump them for you. It lives at
+# .github/dependabot.yml because GitHub looks for it at that exact path in
+# every repo — you don't run this file yourself, GitHub's servers read it
+# on a schedule.
+#
+# This repo is pure bash with no package manager, but it DOES have a
+# GitHub Actions workflow (.github/workflows/syntax-check.yml) that pins
+# action versions like "actions/checkout@v4". The "github-actions"
+# ecosystem below keeps those pinned versions up to date.
+
+# `version: 2` tells GitHub which Dependabot configuration schema (format
+# version) this file follows — version 2 is the current one.
+version: 2
+# `updates:` is a top-level YAML key whose value is a LIST of "update
+# configs" — each list item (marked with a leading `-`) describes one
+# dependency ecosystem Dependabot should watch and how often to check it.
+updates:
+# `- package-ecosystem: github-actions` starts the first (and only) list
+# item — this watches the versions pinned in this repo's GitHub Actions
+# workflow files (like .github/workflows/syntax-check.yml), e.g.
+# "actions/checkout@v4", and opens PRs to bump those version tags.
+- package-ecosystem: github-actions
+  # `directory: "/"` tells Dependabot where to look for workflow files —
+  # the repo root (Dependabot automatically checks under
+  # .github/workflows/ for this ecosystem type).
+  directory: "/"
+  # `schedule:` is a nested key describing how often Dependabot should run
+  # its check for this ecosystem.
+  schedule:
+    # `interval: weekly` means Dependabot checks for new GitHub Actions
+    # versions once a week.
+    interval: weekly
+  # `open-pull-requests-limit: 10` caps how many update pull requests
+  # Dependabot will have open at once FOR THIS ecosystem — once 10 are
+  # open, it won't create more until some get merged/closed.
+  open-pull-requests-limit: 10
