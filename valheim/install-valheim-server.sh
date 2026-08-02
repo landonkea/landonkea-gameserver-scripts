@@ -75,7 +75,9 @@ readonly INSTANCES_DIR="${VALHEIM_BASE}/instances"
 readonly INSTANCE_REGISTRY="${VALHEIM_BASE}/instances.registry"
 readonly BASE_TMP_DIR="${VALHEIM_BASE}/tmp"
 
-readonly STEAMCMD_URL="https://steamcdn-a.akamaihd.net/client/installer/steamcmd_linux.tar.gz"
+# STEAMCMD_URL is already declared readonly by lib/common.sh (sourced
+# above) -- redeclaring it here would abort the script with "readonly
+# variable" under set -e.
 readonly STEAM_APPID_VALHEIM_SERVER=896660
 
 readonly SYSTEMD_TEMPLATE_UNIT_PATH="/etc/systemd/system/valheim@.service"
@@ -119,6 +121,7 @@ readonly MAXPLAYERCOUNT_NAME="MaxPlayerCount"
 readonly THUNDERSTORE_API_BASE="https://thunderstore.io/api/experimental/package"
 
 ASSUME_DEFAULTS=0   # set to 1 by -y/--yes
+DRY_RUN=0            # set to 1 by --dry-run; add_instance shows what would happen without doing it
 ORIGINAL_ARGS_STRING=""   # set at the top of main(); used by on_error's re-run suggestion
 
 ###############################################################################
@@ -179,9 +182,11 @@ registry_base_exists() { [[ -d "$VALHEIM_BASE" ]]; }
 registry_next_port() {
     registry_ensure
     local max_used candidate="$PORT_RANGE_START"
-    max_used="$(awk -F: '{print $2}' "$INSTANCE_REGISTRY" 2>/dev/null | sort -n | tail -1)"
-    if [[ -n "$max_used" ]]; then
-        candidate=$(( max_used + PORT_RANGE_STEP ))
+    if [[ -f "$INSTANCE_REGISTRY" ]]; then
+        max_used="$(awk -F: '{print $2}' "$INSTANCE_REGISTRY" 2>/dev/null | sort -n | tail -1)"
+        if [[ -n "$max_used" ]]; then
+            candidate=$(( max_used + PORT_RANGE_STEP ))
+        fi
     fi
     echo "$candidate"
 }
@@ -201,13 +206,16 @@ registry_add() {
 registry_remove() {
     local name="$1"
     registry_ensure
-    sed -i "/^${name}:/d" "$INSTANCE_REGISTRY"
+    if [[ -f "$INSTANCE_REGISTRY" ]]; then
+        sed -i "/^${name}:/d" "$INSTANCE_REGISTRY"
+    fi
 }
 
 # registry_has: true if an instance with this name is already registered.
 registry_has() {
     local name="$1"
     registry_ensure
+    [[ -f "$INSTANCE_REGISTRY" ]] || return 1
     grep -q "^${name}:" "$INSTANCE_REGISTRY" 2>/dev/null
 }
 
@@ -216,12 +224,14 @@ registry_has() {
 registry_port_for() {
     local name="$1"
     registry_ensure
+    [[ -f "$INSTANCE_REGISTRY" ]] || return 0
     awk -F: -v n="$name" '$1==n{print $2}' "$INSTANCE_REGISTRY" 2>/dev/null | head -n1
 }
 
 # registry_list_names: prints every registered instance name, one per line.
 registry_list_names() {
     registry_ensure
+    [[ -f "$INSTANCE_REGISTRY" ]] || return 0
     awk -F: '{print $1}' "$INSTANCE_REGISTRY" 2>/dev/null
 }
 
@@ -1291,6 +1301,14 @@ shopt -u nullglob
 if [[ ${#current_files[@]} -gt 0 ]]; then
     cp -a "${current_files[@]}" "$safety_dir/"
     log_info "[$name] Safety copy of current world saved to ${safety_dir}"
+    # Clear the same set of files we just safety-copied, so the restore
+    # doesn't extract on top of stale world files (e.g. leftover .db.old
+    # sidecars from a previous world) -- the safety copy just above
+    # already preserved them if they're needed. Each entry here is one
+    # named, already-enumerated path under INSTANCE_WORLD_DIR (never a
+    # blanket "rm -rf a whole directory" call), so there's no risk of
+    # following a symlink out to somewhere unintended.
+    rm -rf -- "${current_files[@]}"
 else
     log_warn "[$name] No current world files to back up before restoring (fine on a first restore)."
 fi
@@ -1905,6 +1923,41 @@ add_instance() {
     check_host_capacity_before_add
     gather_instance_input "$suggested_name"
 
+    # --- DRY RUN: show what WOULD happen, then stop -- deliberately
+    # BEFORE create_instance_directories/sync_instance_from_golden/
+    # install_bepinex_and_maxplayercount below, since those create real
+    # directories and download/install real files. Nothing above this
+    # point (input gathering, capacity check) has any real side effect. ---
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+        local dry_name="${INSTANCE_NAME}"
+        local dry_port="${SERVER_PORT}"
+        local dry_port2=$(( dry_port + 1 ))
+        local dry_port3=$(( dry_port + 2 ))
+        local avail_mb
+        avail_mb="$(df --output=avail -m /srv 2>/dev/null | tail -n1 | tr -d '[:space:]')"
+        echo
+        echo -e "${C_BOLD}========== DRY RUN -- nothing has been changed ==========${C_RESET}"
+        echo
+        echo "  Instance name:     ${dry_name}"
+        echo "  Server name:       ${SERVER_NAME}"
+        echo "  World name:        ${WORLD_NAME}"
+        echo "  Ports:             ${dry_port}, ${dry_port2}, ${dry_port3} (UDP)"
+        echo "  Max players:       ${MAX_PLAYERS}$([ "$MAX_PLAYERS" -gt "$VANILLA_MAX_PLAYERS" ] && echo " (requires installing BepInEx + MaxPlayerCount mods)")"
+        echo "  Crossplay:         $([ "$CROSSPLAY" == "1" ] && echo "yes" || echo "no")"
+        echo "  On-demand:         $([ "$ON_DEMAND" == "1" ] && echo "yes (sleep listener)" || echo "no (always running)")"
+        echo "  Firewall:          ufw allow for each port above"
+        echo "  Backup dir:        ${BACKUP_DIR}"
+        echo "  Backup schedule:   daily at ${BACKUP_TIME}, ${BACKUP_RETENTION_DAYS}-day retention"
+        echo "  Update schedule:   daily at ${UPDATE_TIME}"
+        echo "  Disk available:    ${avail_mb:-unknown} MB on /srv"
+        echo
+        echo -e "${C_BOLD}To proceed for real, re-run without --dry-run:${C_RESET}"
+        echo "  ./${SCRIPT_NAME} --add-instance ${dry_name}"
+        echo
+        return 0
+    fi
+    # --- END DRY RUN ---
+
     create_instance_directories "$INSTANCE_NAME"
     sync_instance_from_golden "$INSTANCE_NAME"
 
@@ -2458,6 +2511,7 @@ Options:
   --list-instances          List every configured shard.
   --status [name]           Show live status for one or all instances.
   --uninstall               Remove everything (asks before deleting data).
+  --dry-run                 Preview what add_instance WOULD do without doing it.
   --version                 Show the installer version and exit.
   -y, --yes                 Non-interactive: accept defaults / generate a
                              random password instead of prompting.
@@ -2553,6 +2607,7 @@ parse_args() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
             -y|--yes) ASSUME_DEFAULTS=1 ;;
+            --dry-run) DRY_RUN=1 ;;
             --add-instance)
                 # --add-instance <name> is documented as required to add a
                 # shard, but --game <game> alone (no --add-instance at all)
@@ -2633,7 +2688,11 @@ main() {
 
     print_banner
     init_logging "$LOG_FILE" "Valheim installer v${SCRIPT_VERSION}"
-    ensure_base_install
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+        log_info "--dry-run: skipping ensure_base_install (packages, user, systemd, firewall, fail2ban, cron, golden install, etc.) -- nothing on this machine will be changed."
+    else
+        ensure_base_install
+    fi
     add_instance "$ADD_INSTANCE_NAME"
     log_line "Valheim installer finished successfully (instance: ${INSTANCE_NAME})."
 }
