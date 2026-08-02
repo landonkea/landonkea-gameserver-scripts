@@ -2144,6 +2144,12 @@ set -uo pipefail
 
 LOG_FILE="/srv/valheim/host-capacity.log"
 STATE_FILE="/srv/valheim/tmp/host-capacity-high-streak"
+# These three placeholder values are overwritten by the sed commands right
+# after this heredoc is written (see write_host_capacity_monitor_script
+# below), so they always match this installer's CAPACITY_HIGH_THRESHOLD /
+# CAPACITY_LOW_THRESHOLD / CAPACITY_SUSTAINED_SAMPLES constants -- one
+# source of truth instead of two copies of the same numbers that could
+# silently drift apart if only one ever got edited.
 HIGH_THRESHOLD=80
 LOW_THRESHOLD=40
 SUSTAINED_SAMPLES=3
@@ -2177,6 +2183,18 @@ else
     :
 fi
 EOF
+    # The heredoc above is quoted ('EOF'), so none of ITS OWN $variables
+    # (cpu_pct, streak, etc.) were expanded while writing the file -- they
+    # need to stay literal so they're evaluated later, every time the
+    # generated script actually runs. That means the three threshold
+    # placeholders can't be interpolated at heredoc-write time either, so
+    # we patch just those three lines afterward with sed, from this
+    # installer's own CAPACITY_* constants (defined once, near the top of
+    # this file) -- keeping a single source of truth instead of two copies
+    # of the same numbers to keep in sync by hand.
+    sed -i "s/^HIGH_THRESHOLD=.*/HIGH_THRESHOLD=${CAPACITY_HIGH_THRESHOLD}/" "${SCRIPTS_DIR}/host-capacity-monitor.sh"
+    sed -i "s/^LOW_THRESHOLD=.*/LOW_THRESHOLD=${CAPACITY_LOW_THRESHOLD}/" "${SCRIPTS_DIR}/host-capacity-monitor.sh"
+    sed -i "s/^SUSTAINED_SAMPLES=.*/SUSTAINED_SAMPLES=${CAPACITY_SUSTAINED_SAMPLES}/" "${SCRIPTS_DIR}/host-capacity-monitor.sh"
     chmod 750 "${SCRIPTS_DIR}/host-capacity-monitor.sh"
     chown "$VALHEIM_USER:$VALHEIM_GROUP" "${SCRIPTS_DIR}/host-capacity-monitor.sh"
 }
@@ -2609,11 +2627,14 @@ parse_args() {
             -y|--yes) ASSUME_DEFAULTS=1 ;;
             --dry-run) DRY_RUN=1 ;;
             --add-instance)
-                # --add-instance <name> is documented as required to add a
-                # shard, but --game <game> alone (no --add-instance at all)
-                # is also accepted and behaves identically -- the flag here
-                # only exists to optionally capture the instance NAME that
-                # follows it, not to gate whether an instance gets added.
+                # The instance name after --add-instance is optional here --
+                # this branch only captures it if one was given. Whether or
+                # not --add-instance appears at all, main() always ends by
+                # calling add_instance "$ADD_INSTANCE_NAME": with a name it
+                # skips straight to that shard's prompts, and with an empty
+                # string gather_instance_input() just prompts for the name
+                # too. That's also why a bare first run (no flags at all)
+                # still successfully installs one instance.
                 if [[ -n "${2:-}" && "${2:0:1}" != "-" ]]; then
                     ADD_INSTANCE_NAME="$2"
                     shift
