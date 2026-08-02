@@ -111,7 +111,9 @@ readonly INSTANCES_DIR="${GS_BASE}/instances"
 readonly INSTANCE_REGISTRY="${GS_BASE}/instances.registry"
 readonly BASE_TMP_DIR="${GS_BASE}/tmp"
 
-readonly STEAMCMD_URL="https://steamcdn-a.akamaihd.net/client/installer/steamcmd_linux.tar.gz"
+# STEAMCMD_URL is already declared readonly by lib/common.sh (sourced
+# above) -- redeclaring it here would abort the script with "readonly
+# variable" under set -e.
 
 readonly SYSTEMD_TEMPLATE_UNIT_PATH="/etc/systemd/system/gameserver@.service"
 readonly LOGROTATE_CONF="/etc/logrotate.d/gameserver"
@@ -238,9 +240,11 @@ registry_ensure() {
 registry_next_port() {
     registry_ensure
     local max_used candidate="$PORT_RANGE_START"
-    max_used="$(awk -F: '{print $3}' "$INSTANCE_REGISTRY" 2>/dev/null | sort -n | tail -1)"
-    if [[ -n "$max_used" ]]; then
-        candidate=$(( max_used + PORT_RANGE_STEP ))
+    if [[ -f "$INSTANCE_REGISTRY" ]]; then
+        max_used="$(awk -F: '{print $3}' "$INSTANCE_REGISTRY" 2>/dev/null | sort -n | tail -1)"
+        if [[ -n "$max_used" ]]; then
+            candidate=$(( max_used + PORT_RANGE_STEP ))
+        fi
     fi
     echo "$candidate"
 }
@@ -255,19 +259,44 @@ registry_add() {
 }
 
 # registry_remove: deletes the line for the given instance name, if present.
-registry_remove() { local name="$1"; registry_ensure; sed -i "/^${name}:/d" "$INSTANCE_REGISTRY"; }
+registry_remove() {
+    local name="$1"
+    registry_ensure
+    if [[ -f "$INSTANCE_REGISTRY" ]]; then
+        sed -i "/^${name}:/d" "$INSTANCE_REGISTRY"
+    fi
+}
 
 # registry_has: true if an instance with this name is already registered.
-registry_has() { local name="$1"; registry_ensure; grep -q "^${name}:" "$INSTANCE_REGISTRY" 2>/dev/null; }
+registry_has() {
+    local name="$1"
+    registry_ensure
+    [[ -f "$INSTANCE_REGISTRY" ]] || return 1
+    grep -q "^${name}:" "$INSTANCE_REGISTRY" 2>/dev/null
+}
 
 # registry_port_for: prints the registered port for an instance name.
-registry_port_for() { local name="$1"; registry_ensure; awk -F: -v n="$name" '$1==n{print $3}' "$INSTANCE_REGISTRY" 2>/dev/null | head -n1; }
+registry_port_for() {
+    local name="$1"
+    registry_ensure
+    [[ -f "$INSTANCE_REGISTRY" ]] || return 0
+    awk -F: -v n="$name" '$1==n{print $3}' "$INSTANCE_REGISTRY" 2>/dev/null | head -n1
+}
 
 # registry_game_for: prints the registered game profile id for an instance name.
-registry_game_for() { local name="$1"; registry_ensure; awk -F: -v n="$name" '$1==n{print $2}' "$INSTANCE_REGISTRY" 2>/dev/null | head -n1; }
+registry_game_for() {
+    local name="$1"
+    registry_ensure
+    [[ -f "$INSTANCE_REGISTRY" ]] || return 0
+    awk -F: -v n="$name" '$1==n{print $2}' "$INSTANCE_REGISTRY" 2>/dev/null | head -n1
+}
 
 # registry_list_names: prints every registered instance name, one per line.
-registry_list_names() { registry_ensure; awk -F: '{print $1}' "$INSTANCE_REGISTRY" 2>/dev/null; }
+registry_list_names() {
+    registry_ensure
+    [[ -f "$INSTANCE_REGISTRY" ]] || return 0
+    awk -F: '{print $1}' "$INSTANCE_REGISTRY" 2>/dev/null
+}
 
 ###############################################################################
 # INSTANCE PATH HELPERS
@@ -356,10 +385,19 @@ load_game_profile() {
     local game_id="$1"
     local profile_file="${PROFILES_DIR}/${game_id}.profile.sh"
     if [[ ! -f "$profile_file" ]]; then
-        log_err "No profile found for game '${game_id}'."
-        log_err "Available games:"
-        list_available_games | sed 's/^/  /' >&2
-        die "Unknown game '${game_id}'."
+        # Not installed under PROFILES_DIR yet (e.g. --dry-run on a fresh
+        # box, before ensure_base_install has ever run install_profiles) --
+        # fall back to the copy bundled alongside this script itself, same
+        # as run_environment_check's --check mode already does.
+        local bundled_file="${SCRIPT_DIR}/profiles/${game_id}.profile.sh"
+        if [[ -f "$bundled_file" ]]; then
+            profile_file="$bundled_file"
+        else
+            log_err "No profile found for game '${game_id}'."
+            log_err "Available games:"
+            list_available_games | sed 's/^/  /' >&2
+            die "Unknown game '${game_id}'."
+        fi
     fi
     # "source" is what actually LOADS the profile file -- it's different
     # from just running the file as its own separate program. Sourcing
@@ -663,7 +701,7 @@ gather_generic_instance_input() {
     # most for exactly the situation where someone picks a RAM-hungry game
     # (ARK-family titles especially) on a small, inexpensive server without
     # realizing the two don't fit together until something crashes later.
-    if [[ -n "${PROFILE_RECOMMENDED_RAM_MB:-}" ]] && (( TOTAL_RAM_MB < PROFILE_RECOMMENDED_RAM_MB )); then
+    if [[ -n "${PROFILE_RECOMMENDED_RAM_MB:-}" && -n "${TOTAL_RAM_MB:-}" ]] && (( TOTAL_RAM_MB < PROFILE_RECOMMENDED_RAM_MB )); then
         log_warn "${PROFILE_DISPLAY_NAME} recommends at least ${PROFILE_RECOMMENDED_RAM_MB}MB RAM; this machine has ${TOTAL_RAM_MB}MB total."
         log_warn "With less than that, it may run poorly, fail to start, or crash under real load."
         if [[ "$ASSUME_DEFAULTS" -eq 1 ]]; then
@@ -1323,6 +1361,16 @@ if [[ -n "$(ls -A "$INSTANCE_DATA_DIR" 2>/dev/null)" ]]; then
     log_info "[$name] Safety copy of current data saved to ${safety_dir}"
 else
     log_warn "[$name] No current data to back up before restoring (fine on a first restore)."
+fi
+
+# Clear the destination before extracting, so the result is exactly the
+# archive's contents -- nothing stale left mixed in from the previous
+# data (the safety copy just above already preserved it). Only ever
+# removes DIRECT children of INSTANCE_DATA_DIR (no recursive descent
+# into subdirectories that could follow a symlink out of the target),
+# and only runs at all if that variable is a real, non-root directory.
+if [[ -n "$INSTANCE_DATA_DIR" && "$INSTANCE_DATA_DIR" != "/" && -d "$INSTANCE_DATA_DIR" ]]; then
+    find "$INSTANCE_DATA_DIR" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
 fi
 
 log_info "[$name] Extracting backup: $backup_file"
@@ -2123,21 +2171,13 @@ add_instance() {
 
     load_game_profile "$game_id"
 
-    if [[ "${PROFILE_REQUIRES_WINE}" == "1" ]]; then
-        ensure_wine_installed
-    fi
-    if [[ "${PROFILE_REQUIRES_JAVA:-0}" == "1" ]]; then
-        ensure_java_installed
-    fi
-    if [[ "${PROFILE_REQUIRES_XVFB:-0}" == "1" ]]; then
-        ensure_xvfb_installed
-    fi
-
-    install_or_update_golden "$game_id"
-
     gather_generic_instance_input "$suggested_name"
 
-    # --- DRY RUN: show what WOULD happen, then stop ---
+    # --- DRY RUN: show what WOULD happen, then stop -- deliberately
+    # BEFORE any of ensure_wine_installed/ensure_java_installed/
+    # ensure_xvfb_installed/install_or_update_golden below, since those
+    # perform real apt-get/steamcmd operations. Nothing above this point
+    # (profile loading, prompting) has any real side effect. ---
     if [[ "$DRY_RUN" -eq 1 ]]; then
         local dry_name="${INSTANCE_NAME}"
         local dry_port="${SERVER_PORT}"
@@ -2171,6 +2211,18 @@ add_instance() {
         return 0
     fi
     # --- END DRY RUN ---
+
+    if [[ "${PROFILE_REQUIRES_WINE}" == "1" ]]; then
+        ensure_wine_installed
+    fi
+    if [[ "${PROFILE_REQUIRES_JAVA:-0}" == "1" ]]; then
+        ensure_java_installed
+    fi
+    if [[ "${PROFILE_REQUIRES_XVFB:-0}" == "1" ]]; then
+        ensure_xvfb_installed
+    fi
+
+    install_or_update_golden "$game_id"
 
     create_instance_directories "$INSTANCE_NAME"
     # From this point on, a directory exists for this instance name but
@@ -2709,7 +2761,11 @@ main() {
 
     print_banner
     init_logging "$LOG_FILE" "$SCRIPT_NAME"
-    ensure_base_install
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+        log_info "--dry-run: skipping ensure_base_install (packages, user, systemd, firewall, fail2ban, cron, etc.) -- nothing on this machine will be changed."
+    else
+        ensure_base_install
+    fi
     add_instance "$GAME_ID" "$ADD_INSTANCE_NAME"
     log_line "Installer finished successfully (game: ${GAME_ID}, instance: ${INSTANCE_NAME})."
 }
