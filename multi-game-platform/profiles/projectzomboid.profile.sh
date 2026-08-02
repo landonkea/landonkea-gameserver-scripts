@@ -51,6 +51,10 @@ PROFILE_STEAM_PLATFORM="linux"
 # this is a native Linux program, run it directly."
 PROFILE_REQUIRES_WINE=0
 
+# PROFILE_REQUIRES_JAVA=0: this game does NOT need a Java Virtual
+# Machine to run -- 0 means "no Java needed."
+PROFILE_REQUIRES_JAVA=0
+
 # PROFILE_PORT_COUNT=2: this game needs 2 network ports in a row
 # (one for game traffic, one for the remote admin console).
 PROFILE_PORT_COUNT=2

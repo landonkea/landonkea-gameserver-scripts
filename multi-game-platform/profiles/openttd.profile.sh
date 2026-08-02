@@ -153,16 +153,23 @@ max_clients = ${TTD_MAX_PLAYERS}
 # server_password: password needed to join (empty = no password)
 server_password = ${TTD_PASSWORD}
 CFG
-    # LAUNCH_ARGS: command-line flags for the OpenTTD server
+    # LAUNCH_ARGS: command-line flags for the OpenTTD server.
+    # BUG FIX: this used to also pass "-d <path>" and "-M <path>", but those
+    # are NOT save-directory flags -- "-d" actually sets OpenTTD's debug
+    # verbosity level (0-9), and "-M" forces which music SET to load, not a
+    # folder. Passing a filesystem path to either would have been silently
+    # wrong (misread as a debug-level spec / an unknown music set), not an
+    # actual save-directory redirect. OpenTTD doesn't need a CLI flag for
+    # this at all: it automatically saves games/autosaves/screenshots next
+    # to whatever config file it's using (see -c below), which is already
+    # this instance's own INSTANCE_DATA_DIR -- so the save/autosave folders
+    # created above are picked up on their own, no extra flag required.
     LAUNCH_ARGS=(
         # -D: run in dedicated server mode (no game window)
         -D
-        # -c: path to the config file we just wrote
+        # -c: path to the config file we just wrote -- OpenTTD also uses
+        # this file's directory as the base for its save/autosave folders
         -c "$cfg"
-        # -d: path to the save game directory
-        -d "${INSTANCE_DATA_DIR}/save"
-        # -M: path to the autosave directory
-        -M "${INSTANCE_DATA_DIR}/autosave"
     )
 }
 
