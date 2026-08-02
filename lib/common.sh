@@ -102,13 +102,27 @@ ts() { # define the timestamp function
 } # end of ts()
 
 # log_line(): appends one plain-text line to the log file.
-# The 2>/dev/null || true at the end silently swallows any error (like
-# "Permission denied" if we haven't gained root yet) so the script
-# doesn't crash just because it tried to log before it had permission.
+# Must never itself cause the calling script to abort (every log_* function
+# is called constantly, including before we've gained root -- e.g.
+# require_root's own "not running as root" warning) -- so failures here are
+# fully swallowed, both the message AND the exit code.
 log_line() { # define the log_line function
     { # group the append + error suppression together
         printf '%s %s\n' "$(ts)" "$1" # print timestamp, space, the message, newline
-    } >> "$LOG_FILE" 2>/dev/null # append to the log file; swallow errors
+    } 2>/dev/null >> "$LOG_FILE" || true
+    # Redirections apply left-to-right as bash sets them up, so 2>/dev/null
+    # is deliberately listed FIRST: if the later ">> $LOG_FILE" itself fails
+    # to even OPEN the file (e.g. "Permission denied" because we haven't
+    # been re-launched with sudo yet, not merely a failure while writing),
+    # bash reports that failure to whatever stderr is bound to AT THAT
+    # MOMENT -- which, because of this ordering, is already /dev/null. A
+    # single trailing 2>/dev/null (the previous version's approach) cannot
+    # catch this case: the open failure is reported before that later
+    # redirection ever takes effect. The final "|| true" is a second,
+    # independent safety net: even with the message fully suppressed, the
+    # compound command's own exit status would otherwise still be non-zero,
+    # which would trip `set -e` in any strict-mode caller and abort ITS
+    # script too, merely because a log line couldn't be written.
 } # end of log_line()
 
 # log_info(): prints a blue [INFO] message to the terminal (stdout).

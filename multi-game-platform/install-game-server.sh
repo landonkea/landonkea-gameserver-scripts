@@ -78,30 +78,79 @@
 #      that actually runs when this file is executed, at the very bottom.
 ###############################################################################
 
+# BASH_VERSION is a variable bash itself always sets, so if it's empty/unset
+# this file got launched with a DIFFERENT interpreter (e.g. `sh
+# install-game-server.sh`, where `sh` is often dash, not bash). The rest of
+# this script uses bash-only syntax ([[ ]], arrays, etc.), which dash cannot
+# run, so we fail immediately with a clear message instead of a confusing
+# syntax error deep inside the file. "${BASH_VERSION:-}" is parameter
+# expansion with a default: "use $BASH_VERSION, or an empty string if it's
+# unset" -- avoiding an "unbound variable" error under `set -u` (enabled
+# below) if run under a shell that doesn't define it at all.
 if [ -z "${BASH_VERSION:-}" ]; then
     echo "ERROR: This script must be run with bash, e.g.: sudo bash install-game-server.sh" >&2
     exit 1
 fi
 
+# set -Eeuo pipefail is the standard "strict mode" combo for bash scripts:
+#   -E  ERR trap (see `trap ... ERR` below) is inherited into functions and
+#       subshells too, not just the top-level script -- without this, a
+#       failure inside a function wouldn't trigger our on_error handler.
+#   -e  ("errexit") abort the whole script the instant any command exits
+#       non-zero, instead of ignoring the failure and barreling ahead.
+#   -u  ("nounset") treat referencing an undefined variable as an error
+#       instead of silently substituting an empty string -- catches typos'd
+#       variable names immediately instead of them causing a mysterious bug
+#       later.
+#   -o pipefail  makes a pipeline (cmd1 | cmd2) fail if ANY command in it
+#       fails, not just the last one -- normally only the last command's
+#       exit code counts, which can hide a real failure earlier in the pipe.
 set -Eeuo pipefail
+# IFS ("Internal Field Separator") controls which characters bash treats as
+# word boundaries when it splits unquoted text -- e.g. inside a `for x in
+# $var` loop, or a `read` without a delimiter. The default IFS is space,
+# tab, and newline, which means an instance name or file path containing a
+# space could silently become TWO words. Setting IFS to just newline+tab
+# here removes the space from that list, so plain spaces inside a quoted
+# variable never accidentally get split into separate "words" -- a
+# defensive hardening measure common in strict-mode bash scripts. Individual
+# loops below that specifically WANT space-splitting (or colon-splitting,
+# etc.) set IFS again just for that one line.
 IFS=$'\n\t'
 
 # --- Load shared library with common functions ---
+# BASE_DIR is this script's own directory, computed independent of the
+# caller's current working directory: `dirname "${BASH_SOURCE[0]}"` gets the
+# folder this file lives in, and `cd ... && pwd` resolves that to a full
+# absolute path (turning something like "./multi-game-platform" into
+# "/home/user/multi-game-platform"), which matters because we're about to
+# `cd`-independently source another file relative to it, and later re-exec
+# ourselves under sudo from a possibly different working directory.
 BASE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-export BASE_DIR
+export BASE_DIR # exported so common.sh (and anything it launches) can see it too
+# "source" loads lib/common.sh's variables and functions directly into THIS
+# script's own memory (see load_game_profile below for a fuller explanation
+# of what sourcing means) -- that's how log_info, die, require_root,
+# validate_port, and the rest of the shared library become usable here.
 source "${BASE_DIR}/../lib/common.sh" "${BASE_DIR}"
 
 ###############################################################################
 # GLOBAL CONSTANTS
+# `readonly` makes each of these a constant: any later attempt to reassign
+# one is a hard error under `set -e`. That's deliberate here -- these are
+# fixed facts about this platform's on-disk layout and behavior that no
+# code path should ever be able to accidentally change mid-run.
 ###############################################################################
 readonly SCRIPT_VERSION="1.0.0"
+# basename strips the directory part off a path, leaving just the filename
+# (e.g. "/opt/foo/install-game-server.sh" -> "install-game-server.sh").
 readonly SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
 readonly SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 readonly LOG_FILE="/var/log/gameserver-install.log"
 
-readonly GS_USER="gameserver"
-readonly GS_GROUP="gameserver"
-readonly GS_BASE="/srv/gameservers"
+readonly GS_USER="gameserver"   # the unprivileged Linux user every game server process runs as
+readonly GS_GROUP="gameserver"  # its matching group
+readonly GS_BASE="/srv/gameservers" # the root directory everything this platform manages lives under
 
 readonly STEAMCMD_DIR="${GS_BASE}/steamcmd"
 readonly GOLDEN_DIR="${GS_BASE}/golden"           # one shared, per-GAME SteamCMD-managed install
@@ -143,6 +192,10 @@ readonly SYSTEMD_SLEEP_TEMPLATE_UNIT_PATH="/etc/systemd/system/gameserver-sleep@
 readonly CRON_IDLE_FILE="/etc/cron.d/gameserver-idle"
 readonly IDLE_MINUTES_THRESHOLD=5   # auto-save + auto-stop after this many consecutive idle minutes
 
+# These three are plain (non-readonly) globals because, unlike the constants
+# above, their values legitimately change while the script runs -- CLI flag
+# parsing (parse_args, near the bottom of this file) flips ASSUME_DEFAULTS
+# and DRY_RUN from 0 to 1, and main() fills in ORIGINAL_ARGS_STRING.
 ASSUME_DEFAULTS=0 # when set to 1 via -y/--yes, all prompts use defaults automatically
 DRY_RUN=0         # when set to 1 via --dry-run, add_instance shows what would happen without doing it
 ORIGINAL_ARGS_STRING="" # stores the raw CLI arguments so the error handler can suggest re-running
@@ -153,10 +206,13 @@ ORIGINAL_ARGS_STRING="" # stores the raw CLI arguments so the error handler can 
 
 ###############################################################################
 # ERROR HANDLING / TRAPS
+#
+# A "trap" tells bash "run this command automatically when X happens,"
+# instead of me having to check for X after every single command. Two are
+# registered below: one for ERR (any command failing, thanks to -e above)
+# and one for INT/TERM (Ctrl+C, or another process asking us to stop).
 ###############################################################################
 
-# on_error: the ERR trap handler -- reports where the script failed and
-# reassures the admin that re-running is safe once the issue is fixed.
 # These two track progress through add_instance, purely so on_error
 # (below) can safely clean up a half-created instance directory if
 # something fails partway through setting one up -- WITHOUT ever risking
@@ -172,6 +228,10 @@ PARTIAL_INSTANCE_REGISTERED=0
 # starts clean rather than potentially colliding with leftover partial
 # files from the failed attempt.
 on_error() {
+    # $1/$2/$3 here are NOT this script's own CLI arguments -- they're
+    # whatever the trap command below passed in when it invoked this
+    # function ("$LINENO" "$BASH_COMMAND" "$?"), i.e. the line number, the
+    # exact command text, and the exit code of the command that just failed.
     local line="$1" cmd="$2" rc="$3"
     log_err "Unexpected failure at line ${line} (exit code ${rc}): ${cmd}"
 
@@ -189,6 +249,16 @@ on_error() {
     log_err "Full log: ${LOG_FILE}"
     exit "$rc"
 }
+# `trap 'COMMAND' SIGNAL...` registers COMMAND to run when SIGNAL fires. The
+# command string is single-quoted so $LINENO/$BASH_COMMAND/$? are expanded
+# freshly at the MOMENT the trap fires (not once, right now, while they're
+# still empty) -- $LINENO is the line that failed, $BASH_COMMAND is the
+# literal text of the command that was running, and $? is its exit code.
+# ERR fires on any command failing (see `set -e` above); INT is Ctrl+C;
+# TERM is a normal "please stop" request from another process (e.g. systemd
+# or `kill`) -- both get a friendly message and a distinct exit code (130,
+# the conventional "killed by signal 2 / SIGINT" code) instead of an
+# on_error-style stack trace, since a user-requested interrupt isn't a bug.
 trap 'on_error "$LINENO" "$BASH_COMMAND" "$?"' ERR
 trap 'echo; log_warn "Interrupted by user (Ctrl+C)."; exit 130' INT TERM
 
@@ -227,26 +297,38 @@ print_banner() {
 ###############################################################################
 
 # registry_base_exists: true if the base install has happened at all.
+# The function body is a single [[ ]] test with no explicit `return` -- in
+# bash, a function's exit status defaults to the exit status of the LAST
+# command it ran, so this "returns" 0 (true, meaning "the directory exists")
+# or 1 (false) exactly like an explicit `return` would, just more tersely.
 registry_base_exists() { [[ -d "$GS_BASE" ]]; }
 
 # registry_ensure: creates an empty registry file if one doesn't exist yet.
 # A no-op if the base install hasn't happened at all yet.
 registry_ensure() {
     registry_base_exists || return 0
+    # `[[ cond ]] || { multiple; commands; }` runs the braced block only if
+    # the test is FALSE (file doesn't exist yet) -- the braces group two
+    # commands into one so `||` treats them as a single right-hand side.
     [[ -f "$INSTANCE_REGISTRY" ]] || { touch "$INSTANCE_REGISTRY"; chmod 644 "$INSTANCE_REGISTRY"; }
 }
 
-# registry_next_port: returns the next free port block start.
+# registry_next_port: returns the next free port block start. Scans every
+# existing instance's port column, takes the highest one, and offers the
+# next block after it -- so a newly added instance's ports never collide
+# with an already-registered instance's ports.
 registry_next_port() {
     registry_ensure
     local max_used candidate="$PORT_RANGE_START"
     if [[ -f "$INSTANCE_REGISTRY" ]]; then
+        # awk -F: splits each registry line on ':' and prints field 3 (the
+        # port); sort -n sorts those numerically; tail -1 takes the highest.
         max_used="$(awk -F: '{print $3}' "$INSTANCE_REGISTRY" 2>/dev/null | sort -n | tail -1)"
         if [[ -n "$max_used" ]]; then
             candidate=$(( max_used + PORT_RANGE_STEP ))
         fi
     fi
-    echo "$candidate"
+    echo "$candidate" # the caller captures this via command substitution: $(registry_next_port)
 }
 
 # registry_add: appends "name:game:port:timestamp". Uses a colon-free
@@ -259,15 +341,24 @@ registry_add() {
 }
 
 # registry_remove: deletes the line for the given instance name, if present.
+# Every caller of this function validates `name` against
+# validate_instance_name (letters/digits/'_'/'-' only) BEFORE calling it --
+# that matters here because $name is interpolated directly into a sed
+# regular expression address (/^${name}:/d). An unvalidated name containing
+# regex metacharacters (like ".*") could match far more lines than intended
+# and delete the wrong entries, or all of them.
 registry_remove() {
     local name="$1"
     registry_ensure
     if [[ -f "$INSTANCE_REGISTRY" ]]; then
+        # sed -i edits the file in place; "/^${name}:/d" means "delete any
+        # line that starts with this name followed by a colon."
         sed -i "/^${name}:/d" "$INSTANCE_REGISTRY"
     fi
 }
 
 # registry_has: true if an instance with this name is already registered.
+# Same regex-injection caveat as registry_remove above applies here.
 registry_has() {
     local name="$1"
     registry_ensure
@@ -280,6 +371,11 @@ registry_port_for() {
     local name="$1"
     registry_ensure
     [[ -f "$INSTANCE_REGISTRY" ]] || return 0
+    # awk -v n="$name" passes the shell variable into awk safely (as data,
+    # not as part of awk's own program text), then '$1==n{print $3}' prints
+    # field 3 (the port) only for the line whose field 1 (name) matches --
+    # an exact string comparison, not a regex, so this one has no injection
+    # risk even with an unvalidated name.
     awk -F: -v n="$name" '$1==n{print $3}' "$INSTANCE_REGISTRY" 2>/dev/null | head -n1
 }
 
@@ -341,10 +437,20 @@ validate_backup_dir() {
         echo "Path may not contain: \" ' \` \\ \$"
         return 1
     fi
+    # "$v" != /* means "does NOT start with a forward slash" -- an absolute
+    # path always starts with /, so anything else (like "backups" or
+    # "../backups") is a relative path we deliberately reject: a relative
+    # backup destination would resolve differently depending on whatever
+    # directory a cron job or systemd unit happens to be running from.
     if [[ "$v" != /* ]]; then
         echo "Please provide an absolute path (starting with /)."
         return 1
     fi
+    # Reject the exact data directory, OR anything nested inside it
+    # ("$CURRENT_INSTANCE_DATA_DIR"/* matches any path with that prefix
+    # followed by a slash and more path) -- otherwise the nightly backup
+    # job would be zipping up its own previous backups forever, or restoring
+    # from a backup could wipe the very thing it's trying to restore.
     if [[ -n "${CURRENT_INSTANCE_DATA_DIR:-}" ]] && { [[ "$v" == "$CURRENT_INSTANCE_DATA_DIR" ]] || [[ "$v" == "$CURRENT_INSTANCE_DATA_DIR"/* ]]; }; then
         echo "Backup directory must not be inside this instance's data directory."
         return 1
@@ -368,8 +474,18 @@ CURRENT_INSTANCE_DATA_DIR=""
 # list_available_games: prints every installed game profile's id (one per line).
 list_available_games() {
     local f
+    # "${PROFILES_DIR}"/*.profile.sh is a glob (wildcard pattern) that bash
+    # expands into a list of matching file paths BEFORE the loop even
+    # starts. If NO files match, bash leaves the literal, unexpanded pattern
+    # string as the only "match" (this is bash's default glob behavior) --
+    # that's exactly why the next line checks [[ -e "$f" ]] (does this path
+    # really exist?) and skips it with `continue` if not, so an empty
+    # PROFILES_DIR produces no output instead of one bogus line.
     for f in "${PROFILES_DIR}"/*.profile.sh; do
         [[ -e "$f" ]] || continue
+        # basename "$f" .profile.sh strips both the directory AND the
+        # ".profile.sh" suffix, turning ".../terraria.profile.sh" into just
+        # "terraria" -- the game's short id.
         basename "$f" .profile.sh
     done
 }
@@ -523,13 +639,19 @@ ensure_xvfb_installed() {
 ###############################################################################
 
 # create_gameserver_user: creates the unprivileged, no-login, no-password
-# system group/user every instance's game process runs as.
+# system group/user every instance's game process runs as. Idempotent (safe
+# to call on every run) -- each half checks whether its thing already
+# exists before trying to create it, so re-running the installer never
+# errors out over "user already exists."
 create_gameserver_user() {
     log_step "Creating dedicated '${GS_USER}' system user"
+    # `getent group NAME` looks NAME up in the system's group database
+    # (works whether that database is the plain /etc/group file, LDAP,
+    # etc.) and exits non-zero if no such group exists.
     if getent group "$GS_GROUP" >/dev/null 2>&1; then
         log_info "Group '${GS_GROUP}' already exists."
     else
-        groupadd --system "$GS_GROUP"
+        groupadd --system "$GS_GROUP" # --system: a service/daemon group, not an interactive human account
         log_ok "Group '${GS_GROUP}' created."
     fi
     if id -u "$GS_USER" >/dev/null 2>&1; then
@@ -539,6 +661,10 @@ create_gameserver_user() {
                 --no-create-home --shell /usr/sbin/nologin \
                 --comment "Dedicated game server (unprivileged, no login)" \
                 "$GS_USER"
+        # --shell /usr/sbin/nologin: this account can never get an
+        # interactive shell (e.g. via `su gameserver` or SSH) -- it exists
+        # purely so game server processes have an unprivileged identity to
+        # run under, never as a way for a human to log in.
         log_ok "User '${GS_USER}' created (no login shell, no password)."
     fi
 }
@@ -547,6 +673,11 @@ create_gameserver_user() {
 # gameserver user. Uses `runuser -u USER -- CMD` (not `-s SHELL -c CMD`,
 # which util-linux's runuser rejects as mutually exclusive with -u).
 run_as_gameserver() {
+    # `--` marks the end of runuser's own options, so anything after it is
+    # treated purely as the command to run, even if it happened to start
+    # with a dash. "$1" here is the FULL command line as one string
+    # (typically built up with embedded quoting by the caller), handed to
+    # `bash -c` which parses and executes it as if typed at a prompt.
     runuser -u "$GS_USER" -- bash -c "$1"
 }
 
@@ -561,6 +692,10 @@ create_base_directory_layout() {
     log_step "Creating base directory layout under ${GS_BASE}"
     local dir
     for dir in "$GS_BASE" "$STEAMCMD_DIR" "$GOLDEN_DIR" "$SCRIPTS_DIR" "$PROFILES_DIR" "$INSTANCES_DIR" "$BASE_TMP_DIR"; do
+        # `install -d` creates a directory (like mkdir -p) AND sets its
+        # owner/group/mode in one atomic step, instead of mkdir followed by
+        # separate chown/chmod calls -- there's no brief window where the
+        # directory exists with the wrong (looser) permissions.
         install -d -o "$GS_USER" -g "$GS_GROUP" -m 0750 "$dir"
     done
     registry_ensure
@@ -581,6 +716,8 @@ install_profiles() {
         chmod 640 "${PROFILES_DIR}/$(basename "$f")"
         chown "$GS_USER:$GS_GROUP" "${PROFILES_DIR}/$(basename "$f")"
     done
+    # `tr '\n' ' '` turns list_available_games' one-name-per-line output
+    # into a single space-separated line, just for a tidier log message.
     log_ok "Installed profiles: $(list_available_games | tr '\n' ' ')"
 }
 
@@ -603,6 +740,10 @@ install_or_update_golden() {
     golden_dir="$(golden_dir_for_game "$game_id")"
     install -d -o "$GS_USER" -g "$GS_GROUP" -m 0750 "$golden_dir"
 
+    # PROFILE_STEAM_APPID is empty for games not distributed via Steam (like
+    # Minecraft) -- those profiles instead provide their own
+    # profile_custom_download function that knows how to fetch that game's
+    # server files directly (e.g. from Mojang's own servers).
     if [[ -z "$PROFILE_STEAM_APPID" ]]; then
         # Non-Steam game (e.g. Minecraft) -- the profile handles its own download.
         log_step "[$game_id] Installing/updating the shared server files (direct download, not Steam)"
@@ -620,10 +761,18 @@ install_or_update_golden() {
         fi
 
         local steamcmd_rc=0
+        # `set +e` temporarily turns OFF the strict "abort on any failure"
+        # behavior enabled at the top of this script, just for the one
+        # command below, then `set -e` immediately turns it back on. This is
+        # necessary because SteamCMD often exits non-zero even on a
+        # perfectly successful install (it's simply not a reliable signal
+        # for this particular tool) -- without this, a normal, successful
+        # run could still abort the whole script. The real check happens a
+        # few lines down: does the expected binary actually exist on disk?
         set +e
         run_as_gameserver "\"${STEAMCMD_DIR}/steamcmd.sh\" ${platform_flag} +force_install_dir \"${golden_dir}\" +login anonymous +app_update ${PROFILE_STEAM_APPID} validate +quit" \
             >> "$LOG_FILE" 2>&1
-        steamcmd_rc=$?
+        steamcmd_rc=$? # capture the exit code immediately -- the next command would overwrite $?
         set -e
         log_info "SteamCMD exited with code ${steamcmd_rc} (see ${LOG_FILE}; verifying the binary directly)."
     fi
@@ -645,6 +794,10 @@ install_or_update_golden() {
 # create_instance_directories: creates the directory tree for one instance.
 create_instance_directories() {
     local name="$1" dir
+    # The backslash at the end of each line is a line continuation -- it
+    # tells bash "this logical line isn't finished yet, keep reading the
+    # next physical line as part of it." Purely a readability choice so this
+    # one long `for ... in a b c d e f` list doesn't run off the screen.
     for dir in "$(instance_dir "$name")" "$(instance_server_dir "$name")" \
                "$(instance_data_dir "$name")" "$(instance_logs_dir "$name")" \
                "$(instance_tmp_dir "$name")" "$(instance_default_backup_dir "$name")"; do
@@ -661,6 +814,12 @@ sync_instance_from_golden() {
     server_dir="$(instance_server_dir "$name")"
     golden_dir="$(golden_dir_for_game "$game_id")"
     log_info "[$name] Syncing server files from the shared golden install..."
+    # The trailing slash on "${golden_dir}/" is significant to rsync: it
+    # means "copy the CONTENTS of this directory," not "copy this directory
+    # itself as a subfolder" -- without it, files would land one level
+    # deeper than intended (e.g. server_dir/golden/foo instead of
+    # server_dir/foo). -a ("archive mode") preserves permissions,
+    # timestamps, and symlinks, and recurses into subdirectories.
     rsync -a "${golden_dir}/" "${server_dir}/"
     chown -R "$GS_USER:$GS_GROUP" "$server_dir"
 }
@@ -719,7 +878,18 @@ gather_generic_instance_input() {
     suggested_port="$(registry_next_port)"
     prompt_and_validate "Base port for this instance (uses ${PROFILE_PORT_COUNT} consecutive port(s))" "$suggested_port" validate_port SERVER_PORT 0
     if command_exists ss; then
+        # `ss -uln` lists listening (-l) UDP (-u) sockets in numeric form
+        # (-n, so it shows raw port numbers instead of resolving service
+        # names); `ss -tln` does the same for TCP. Running both and
+        # concatenating their output (via the `;` inside the same command
+        # substitution) lets one grep check both protocols at once.
         local ss_output; ss_output="$(ss -uln 2>/dev/null; ss -tln 2>/dev/null)"
+        # <<< "$ss_output" is a "here-string" -- it feeds the variable's
+        # text to grep's stdin as if it were a one-line file, without
+        # needing a temp file or a pipe. The [[:space:]] after the port
+        # number avoids a false match against a longer port number that
+        # merely starts with the same digits (e.g. searching for ":80"
+        # shouldn't match ":8080").
         grep -q ":${SERVER_PORT}[[:space:]]" <<< "$ss_output" && log_warn "Port ${SERVER_PORT} already appears to be in use on this machine."
     fi
 
@@ -770,6 +940,16 @@ write_instance_config() {
         echo "UPDATE_TIME=\"${UPDATE_TIME}\""
         echo "DISCORD_WEBHOOK_URL=\"${DISCORD_WEBHOOK_URL}\""
         local varname
+        # "${PROFILE_EXTRA_CONFIG_VARS[@]:-}" loops over every element of an
+        # array the active game profile set (e.g. a Minecraft profile might
+        # list "MAX_PLAYERS RCON_PASSWORD" here) -- the ":-" fallback keeps
+        # this from erroring under `set -u` if a profile doesn't define the
+        # array at all. "${!varname}" is INDIRECT EXPANSION again (see the
+        # fuller explanation in load_game_profile above): it looks up
+        # whatever variable NAME is currently stored in $varname, and
+        # substitutes THAT variable's value -- so this one loop writes out
+        # every profile-specific setting without this script needing to
+        # know their names in advance.
         for varname in "${PROFILE_EXTRA_CONFIG_VARS[@]:-}"; do
             [[ -n "$varname" ]] || continue
             echo "${varname}=\"${!varname}\""
@@ -795,6 +975,17 @@ write_instance_config() {
 # matching game profile), logging, the optional Discord notifier, and a
 # disk-space guard used before risky operations.
 write_common_script() {
+    # `cat > file << 'EOF' ... EOF` is a here-document: everything between
+    # the two EOF markers becomes the file's content. Quoting the opening
+    # delimiter as 'EOF' (with quotes) is important -- it tells bash "do NOT
+    # expand any $variables or `commands` inside this block; write it out
+    # completely literally." That matters enormously here: the text below
+    # is itself a bash SCRIPT that will run later, on a different machine
+    # state, and it has its own $1, $LOG_FILE, etc. that must stay literal
+    # dollar-signs in the generated file, not get replaced by THIS script's
+    # own variables right now while we're merely writing the file out.
+    # (Contrast with the unquoted << EOF used later in this file for
+    # systemd unit files, where we DO want ${GS_USER} etc. substituted in.)
     cat > "${SCRIPTS_DIR}/common.sh" << 'EOF'
 #!/usr/bin/env bash
 # common.sh - shared functions/config sourced by every generated helper
@@ -829,6 +1020,11 @@ log_err()  { echo -e "${C_RED}[FAIL]${C_RESET} $(ts) $1" >&2; }
 # 'gameserver' or root.
 if [[ "${EUID}" -ne 0 && "$(id -un 2>/dev/null)" != "gameserver" ]]; then
     if command -v sudo >/dev/null 2>&1; then
+        # `exec` REPLACES this script's own process with the sudo command,
+        # instead of running sudo as a child and waiting for it -- there is
+        # no "this script" left afterward, just the re-launched one running
+        # as root. -E preserves the calling user's environment variables
+        # across the sudo boundary (so things like a custom PATH survive).
         exec sudo -E bash "$0" "$@"
     else
         echo "ERROR: this needs root (or the 'gameserver' user) to read instance configs, and 'sudo' was not found." >&2
@@ -1034,6 +1230,11 @@ write_fix_permissions_script() {
 set -Eeuo pipefail
 GS_USER="gameserver"
 GS_GROUP="gameserver"
+# "${1:?instance name required}" is parameter expansion with a required
+# check baked in: if $1 was passed and non-empty, this evaluates to its
+# value as normal; if $1 is empty or unset, bash immediately prints
+# "instance name required" to stderr and exits -- a compact way to enforce
+# "this argument is mandatory" without a separate if-statement.
 INSTANCE_DIR="/srv/gameservers/instances/${1:?instance name required}"
 
 chown -R "${GS_USER}:${GS_GROUP}" \
@@ -1062,8 +1263,21 @@ if [[ $EUID -ne 0 ]]; then log_err "Please run with sudo: sudo $0 <instance|all>
 target="${1:-}"
 [[ -n "$target" ]] || { echo "Usage: $0 <instance-name|all>"; list_instance_names_to_stderr; exit 1; }
 
+# names is an empty array being built up one element at a time below.
 names=()
 if [[ "$target" == "all" ]]; then
+    # `while IFS= read -r n; do ...; done < <(COMMAND)` is the standard,
+    # safe way to loop over another command's output line-by-line in bash.
+    # `< <(COMMAND)` is PROCESS SUBSTITUTION: it runs COMMAND and makes its
+    # output readable as if it were a file, fed into this `while` loop's
+    # stdin. This is deliberately NOT written as `COMMAND | while ...`
+    # (a pipe) because a pipe would run the while loop in a SUBSHELL (a
+    # separate, temporary copy of the shell's environment) -- any variables
+    # set inside it, like the `names` array being appended to here, would
+    # vanish the instant the loop ended and never be visible afterward.
+    # Process substitution avoids that subshell entirely. `IFS= read -r n`
+    # (empty IFS, -r) reads each line exactly as-is, without trimming
+    # leading/trailing whitespace or treating backslashes specially.
     while IFS= read -r n; do names+=("$n"); done < <(all_instance_names)
 else
     if [[ ! -f "/srv/gameservers/instances/${target}/config.env" ]]; then
@@ -1997,6 +2211,14 @@ write_all_helper_scripts() {
 # branching lives inside start-instance.sh, not the unit file.
 install_systemd_template() {
     log_step "Installing systemd template unit"
+    # This filename ends in "@.service" -- systemd's convention for a
+    # TEMPLATE unit. Instead of writing a separate .service file for every
+    # single instance, one template covers ALL of them: starting/enabling
+    # "gameserver@myworld" or "gameserver@shard2" reuses this same file,
+    # with systemd substituting the part after the @ (the "instance name,"
+    # a systemd-specific concept distinct from -- though used here to mean
+    # the same thing as -- this platform's own per-shard instance names)
+    # everywhere the literal two characters "%i" appear below.
     cat > "$SYSTEMD_TEMPLATE_UNIT_PATH" << EOF
 [Unit]
 Description=Dedicated Game Server (instance: %i)
@@ -2009,6 +2231,12 @@ User=${GS_USER}
 Group=${GS_GROUP}
 WorkingDirectory=${INSTANCES_DIR}/%i/server
 
+# The leading "+" on ExecStartPre is systemd syntax meaning "run this one
+# command as root, ignoring the unit's own User=/Group=" -- necessary
+# because fix-permissions.sh needs root to chown files it doesn't already
+# own, even though the real game server process (ExecStart, below) still
+# runs as the unprivileged gameserver user like every other command in this
+# unit that doesn't have a "+".
 ExecStartPre=+${SCRIPTS_DIR}/fix-permissions.sh %i
 ExecStart=${SCRIPTS_DIR}/start-instance.sh %i
 
@@ -2039,6 +2267,10 @@ enable_and_start_instance_service() {
     systemctl restart "gameserver@${name}"
     log_info "[$name] Waiting for the server to come up..."
 
+    # Polling loop: checks every 5 seconds, up to max_wait seconds total,
+    # for the service to both be active AND actually have its port bound --
+    # a service can report "active" via systemd well before the game
+    # process has finished initializing enough to start listening.
     local waited=0 max_wait=180 port_ready=0 ss_output
     while (( waited < max_wait )); do
         if systemctl is-active --quiet "gameserver@${name}"; then
@@ -2072,11 +2304,26 @@ enable_and_start_instance_service() {
 # profile declares via profile_port_specs (lines of "offset:protocol:desc").
 configure_firewall_for_instance() {
     local name="$1" base_port="$2" offset proto desc port
+    # profile_port_specs (defined by the active game profile) prints lines
+    # of "offset:protocol:description", e.g. "0:udp:game" then "1:tcp:rcon"
+    # -- IFS=: read splits each line on ':' into the three variables below.
+    # See the process-substitution/while-read explanation in
+    # write_service_wrapper_scripts above for why `< <(...)` is used here
+    # instead of piping into the loop.
     while IFS=: read -r offset proto desc; do
         [[ -n "$offset" ]] || continue
-        port=$(( base_port + offset ))
+        port=$(( base_port + offset )) # arithmetic context: (( )) evaluates offset as a number, not text
+        # "${proto^^}" uppercases the whole string (bash's built-in
+        # case-conversion expansion) -- purely cosmetic, so the log line
+        # reads "Allowing UDP 25000" instead of "Allowing udp 25000".
         log_info "[$name] Allowing ${proto^^} ${port} (${desc})..."
-        ufw allow "${port}/${proto}" comment "gs:${name}:${desc}" >>"$LOG_FILE" 2>&1
+        # `|| true` matters here: ufw is idempotent and normally exits 0
+        # even for a rule that already exists, but if it ever DID fail
+        # (e.g. a transient ufw/iptables hiccup), this is a firewall rule
+        # for one port among several -- not something worth aborting the
+        # entire instance setup over under `set -e`. Mirrors the same
+        # defensive pattern common.sh's configure_firewall_ports() uses.
+        ufw allow "${port}/${proto}" comment "gs:${name}:${desc}" >>"$LOG_FILE" 2>&1 || true
     done < <(profile_port_specs)
 }
 
@@ -2672,11 +2919,19 @@ parse_args() {
             --version) echo "${SCRIPT_NAME} v${SCRIPT_VERSION}"; exit 0 ;;
             --status) STATUS_MODE=1 ;;
             --game)
+                # "${2:0:1}" is SUBSTRING expansion: "${var:OFFSET:LENGTH}"
+                # extracts LENGTH characters starting at OFFSET. Here it
+                # grabs just the first character of $2 -- if $2 is missing
+                # entirely (":-" default kicks in as empty) OR starts with
+                # "-", that means no real value followed --game (the user
+                # probably typed another flag right after it by mistake),
+                # so this reports a clear error instead of swallowing the
+                # next flag as if it were a game id.
                 if [[ -z "${2:-}" || "${2:0:1}" == "-" ]]; then
                     echo "Error: --game requires a game id, e.g. --game terraria" >&2
                     exit 1
                 fi
-                GAME_ID="$2"; shift
+                GAME_ID="$2"; shift # consume the value too (on top of the shift at the loop's end, this eats both --game and its value)
                 ;;
             --add-instance)
                 # --add-instance <name> is documented as required to add a
