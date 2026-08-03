@@ -197,7 +197,7 @@ readonly IDLE_MINUTES_THRESHOLD=5   # auto-save + auto-stop after this many cons
 # parsing (parse_args, near the bottom of this file) flips ASSUME_DEFAULTS
 # and DRY_RUN from 0 to 1, and main() fills in ORIGINAL_ARGS_STRING.
 ASSUME_DEFAULTS=0 # when set to 1 via -y/--yes, all prompts use defaults automatically
-DRY_RUN=0         # when set to 1 via --dry-run, add_instance shows what would happen without doing it
+DRY_RUN=0         # when set to 1 via --dry-run, add_instance/remove_instance/uninstall_everything show what would happen without doing it
 ORIGINAL_ARGS_STRING="" # stores the raw CLI arguments so the error handler can suggest re-running
 
 ###############################################################################
@@ -574,6 +574,31 @@ load_game_profile() {
     for fn in "${required_funcs[@]}"; do
         declare -F "$fn" >/dev/null || die "Profile '${game_id}' is missing required function ${fn}()."
     done
+}
+
+# validate_profile_standalone: the --validate-profile <game> entry point,
+# for contributors writing/editing a profile. Runs exactly the same
+# contract check load_game_profile always runs (required
+# PROFILE_*/profile_* variables and functions), but as its own standalone
+# command with a clear pass/fail message -- so a contributor can check
+# their new profile in one command, without running --check or a real
+# install, and without needing root (loading/sourcing a profile file has
+# no side effects on the machine).
+validate_profile_standalone() {
+    local game_id="$1"
+    log_step "Validating profile '${game_id}'"
+    if load_game_profile "$game_id"; then
+        log_ok "Profile '${game_id}' satisfies the platform's contract (all required variables and functions present)."
+        echo "  Display name: ${PROFILE_DISPLAY_NAME}"
+        echo "  Steam AppID:  ${PROFILE_STEAM_APPID}"
+        echo "  Requires Wine: $([ "$PROFILE_REQUIRES_WINE" == "1" ] && echo "yes" || echo "no")"
+        echo "  Port count:   ${PROFILE_PORT_COUNT}"
+    fi
+    # No explicit failure branch needed here: load_game_profile calls
+    # die() itself (via the required_vars/required_funcs loops above, or
+    # if the profile file can't be found at all) on any contract
+    # violation, which already prints a clear error and exits non-zero --
+    # this function is only ever reached on success.
 }
 
 ###############################################################################
@@ -1479,6 +1504,11 @@ write_backup_script() {
 set -uo pipefail
 source /srv/gameservers/scripts/common.sh
 
+# BACKUP_SIZE_TREND_LOG: one shared CSV (date,instance,size_bytes) that
+# every instance's backup run appends one line to, so backup size over
+# time can be eyeballed or graphed across the whole fleet.
+BACKUP_SIZE_TREND_LOG="${GS_BASE}/backup-size-trend.csv"
+
 target="${1:-}"
 [[ -n "$target" ]] || { echo "Usage: $0 <instance-name|all>"; list_instance_names_to_stderr; exit 1; }
 
@@ -1532,6 +1562,21 @@ backup_one() {
         notify_discord "Backup verification FAILED for [$name] on $(hostname)."
         exit 1
     fi
+
+    # Record this backup's size in a small, shared trend log (one line per
+    # backup run, across every instance): date,instance,size_bytes. This
+    # is intentionally append-only and never pruned by this script itself
+    # -- it's small (one line per backup) and lets an operator eyeball
+    # whether an instance's save data is growing over time, or spot a
+    # sudden jump/drop that might mean something's wrong.
+    local backup_size_bytes
+    backup_size_bytes="$(stat -c%s "$archive_path" 2>/dev/null || wc -c < "$archive_path" 2>/dev/null || echo 0)"
+    backup_size_bytes="${backup_size_bytes//[[:space:]]/}"
+    if [[ ! -f "$BACKUP_SIZE_TREND_LOG" ]]; then
+        echo "date,instance,size_bytes" > "$BACKUP_SIZE_TREND_LOG" 2>/dev/null || true
+    fi
+    echo "$(date '+%Y-%m-%d'),${name},${backup_size_bytes}" >> "$BACKUP_SIZE_TREND_LOG" 2>/dev/null || \
+        log_warn "[$name] Could not write to backup size trend log ${BACKUP_SIZE_TREND_LOG}."
 
     log_ok "[$name] === Backup finished. ${deleted} old backup(s) pruned. ==="
     notify_discord "Backup completed for [$name] on $(hostname): ${archive_name}"
@@ -1789,8 +1834,29 @@ set -uo pipefail
 source /srv/gameservers/scripts/common.sh
 
 GRACE_PERIOD_SECONDS=180
+CRASH_LOG_LINES=15  # how many recent journalctl lines to pull into a Discord notification on auto-restart
 target="${1:-}"
 [[ -n "$target" ]] || { echo "Usage: $0 <instance-name|all>"; list_instance_names_to_stderr; exit 1; }
+
+# capture_crash_reason: pulls the last CRASH_LOG_LINES lines of this
+# instance's journal (i.e. whatever the game process itself printed right
+# before it died) and formats them as a Discord code block, so an
+# auto-restart notification tells you WHY it died, not just THAT it did.
+# Prints an empty string (no extra section) if journalctl has nothing to
+# show, so callers can always safely append its output to a message.
+capture_crash_reason() {
+    local name="$1" lines
+    lines="$(journalctl -u "gameserver@${name}" -n "$CRASH_LOG_LINES" --no-pager -o cat 2>/dev/null || true)"
+    [[ -n "$lines" ]] || return 0
+    # Discord's per-message limit is 2000 chars; truncate defensively so a
+    # chatty crash (a giant stack trace, say) can never make the webhook
+    # POST itself fail outright.
+    if [[ "${#lines}" -gt 1500 ]]; then
+        lines="${lines: -1500}"
+        lines="(...truncated...)"$'\n'"${lines}"
+    fi
+    printf '\n\nLast %s journal lines for gameserver@%s:\n```\n%s\n```' "$CRASH_LOG_LINES" "$name" "$lines"
+}
 
 # check_one: verifies (and, if run as root, self-heals) a single named instance.
 check_one() {
@@ -1821,8 +1887,10 @@ check_one() {
         log_err "[$name] Service is not active."
         if [[ $EUID -eq 0 ]]; then
             log_warn "[$name] Attempting to start..."
+            local crash_log
+            crash_log="$(capture_crash_reason "$name")"
             systemctl start "gameserver@${name}"
-            notify_discord "Instance [$name] was down on $(hostname) -- restarted automatically."
+            notify_discord "Instance [$name] was down on $(hostname) -- restarted automatically.${crash_log}"
         fi
         return 1
     fi
@@ -1849,8 +1917,10 @@ check_one() {
     log_err "[$name] Port ${SERVER_PORT} is not listening after the grace period."
     if [[ $EUID -eq 0 ]]; then
         log_warn "[$name] Restarting..."
+        local crash_log
+        crash_log="$(capture_crash_reason "$name")"
         systemctl restart "gameserver@${name}"
-        notify_discord "Instance [$name] port was unresponsive on $(hostname) -- restarted automatically."
+        notify_discord "Instance [$name] port was unresponsive on $(hostname) -- restarted automatically.${crash_log}"
     fi
     return 1
 }
@@ -2546,10 +2616,36 @@ remove_instance() {
         || die "Instance name '${name}' is invalid: letters, numbers, '_', '-' only, 1-32 characters."
     registry_has "$name" || die "No instance named '${name}' is registered. Use --list-instances to see what exists."
 
-    log_step "Removing instance '${name}'"
     local port game_id
     port="$(registry_port_for "$name")"
     game_id="$(registry_game_for "$name")"
+
+    # --- DRY RUN: show what WOULD happen, then stop -- no service is
+    # touched, no firewall rule is removed, no registry entry is deleted,
+    # and no data directory is examined for removal. ---
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+        echo
+        echo -e "${C_BOLD}========== DRY RUN -- nothing has been changed ==========${C_RESET}"
+        echo
+        echo "  Instance name:     ${name}"
+        echo "  Game:              ${game_id:-unknown}"
+        echo "  Port:              ${port:-unknown}"
+        echo "  Would stop:        gameserver@${name}, gameserver-sleep@${name}"
+        echo "  Would disable:     gameserver@${name}, gameserver-sleep@${name}"
+        if [[ -n "$port" && -n "$game_id" ]]; then
+            echo "  Would remove:      firewall rule(s) for port ${port}"
+        fi
+        echo "  Would remove:      registry entry for '${name}'"
+        echo "  Data directory:    $(instance_dir "$name") (you would be asked before this is deleted)"
+        echo
+        echo -e "${C_BOLD}To proceed for real, re-run without --dry-run:${C_RESET}"
+        echo "  ./${SCRIPT_NAME} --remove-instance ${name}"
+        echo
+        return 0
+    fi
+    # --- END DRY RUN ---
+
+    log_step "Removing instance '${name}'"
     # Try to load the game profile so we know how to tear down firewall
     # rules. If the profile is missing (e.g. it was deleted), log a
     # warning but do NOT abort -- cleanup must still proceed.
@@ -2587,6 +2683,60 @@ remove_instance() {
 }
 
 # list_instances: prints a quick table of every registered instance.
+# list_instances_verbose_row: prints one instance's disk/RAM/uptime line
+# for `--list-instances --verbose`. Kept as its own function (rather than
+# inlined into list_instances) so it's easy to reason about in isolation --
+# every value here comes from a live check (systemctl/du), not the
+# registry, so it reflects the instance's CURRENT state, not what was
+# true when it was added.
+list_instances_verbose_row() {
+    local name="$1"
+    local svc_status="stopped" uptime_text="-" mem_text="n/a" disk_text="N/A"
+
+    if systemctl is-active --quiet "gameserver@${name}" 2>/dev/null; then
+        svc_status="running"
+
+        local active_since active_epoch now_epoch uptime_sec
+        active_since="$(systemctl show "gameserver@${name}" --property=ActiveEnterTimestamp --value 2>/dev/null || true)"
+        if [[ -n "$active_since" ]]; then
+            active_epoch="$(date -d "$active_since" +%s 2>/dev/null || echo 0)"
+            now_epoch="$(date +%s)"
+            uptime_sec=$(( now_epoch - active_epoch ))
+            if [[ "$active_epoch" -gt 0 && "$uptime_sec" -ge 0 ]]; then
+                if [[ "$uptime_sec" -lt 60 ]]; then
+                    uptime_text="<1m"
+                elif [[ "$uptime_sec" -lt 3600 ]]; then
+                    uptime_text="$(( uptime_sec / 60 ))m"
+                elif [[ "$uptime_sec" -lt 86400 ]]; then
+                    uptime_text="$(( uptime_sec / 3600 ))h $(( (uptime_sec % 3600) / 60 ))m"
+                else
+                    uptime_text="$(( uptime_sec / 86400 ))d $(( (uptime_sec % 86400) / 3600 ))h"
+                fi
+            fi
+        fi
+
+        # MemoryCurrent is systemd's cgroup memory accounting for this
+        # service's processes; it reads "[not set]" if accounting is off
+        # (e.g. cgroup v1 without memory controller enabled) -- fall back
+        # to "n/a" rather than showing that raw systemd string.
+        local mem_bytes
+        mem_bytes="$(systemctl show "gameserver@${name}" --property=MemoryCurrent --value 2>/dev/null || true)"
+        if [[ "$mem_bytes" =~ ^[0-9]+$ ]]; then
+            mem_text="$(( mem_bytes / 1024 / 1024 )) MB"
+        fi
+    fi
+
+    local inst_dir
+    inst_dir="$(instance_dir "$name")"
+    if [[ -d "$inst_dir" ]]; then
+        disk_text="$(du -sh "$inst_dir" 2>/dev/null | awk '{print $1}')"
+        [[ -n "$disk_text" ]] || disk_text="N/A"
+    fi
+
+    printf '  %-16s status=%-8s uptime=%-10s mem=%-8s disk=%s\n' \
+        "$name" "$svc_status" "$uptime_text" "$mem_text" "$disk_text"
+}
+
 list_instances() {
     if ! registry_base_exists; then
         echo "Nothing installed yet. Run the installer first: ./${SCRIPT_NAME} --game <game>"
@@ -2600,6 +2750,17 @@ list_instances() {
     echo "Registered instances:"
     printf '%-16s %-14s %-8s %s\n' "NAME" "GAME" "PORT" "CREATED"
     awk -F: '{printf "%-16s %-14s %-8s %s\n", $1, $2, $3, $4}' "$INSTANCE_REGISTRY"
+
+    if [[ "$VERBOSE_MODE" -eq 1 ]]; then
+        echo
+        echo "Live details (status/uptime/memory/disk):"
+        local vname
+        while IFS=: read -r vname _ _ _; do
+            [[ -n "$vname" ]] || continue
+            list_instances_verbose_row "$vname"
+        done < "$INSTANCE_REGISTRY"
+    fi
+
     echo
     echo "For live status: sudo ${SCRIPTS_DIR}/status-instance.sh"
 }
@@ -2737,10 +2898,40 @@ ensure_base_install() {
 ###############################################################################
 uninstall_everything() {
     require_root
+    registry_ensure
+
+    # --- DRY RUN: show what WOULD happen, then stop -- no service is
+    # stopped/disabled, no firewall rule or cron file is removed, and no
+    # data is touched. ---
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+        echo
+        echo -e "${C_BOLD}========== DRY RUN -- nothing has been changed ==========${C_RESET}"
+        echo
+        if [[ -f "$INSTANCE_REGISTRY" && -s "$INSTANCE_REGISTRY" ]]; then
+            echo "  Would stop/disable the following instances:"
+            while IFS=: read -r name game port _; do
+                [[ -n "$name" ]] || continue
+                echo "    - ${name} (${game:-unknown game}, port ${port:-unknown})"
+            done < "$INSTANCE_REGISTRY"
+        else
+            echo "  No instances currently registered."
+        fi
+        echo "  Would remove:      systemd templates (${SYSTEMD_TEMPLATE_UNIT_PATH}, ${SYSTEMD_SLEEP_TEMPLATE_UNIT_PATH})"
+        echo "  Would remove:      cron files (${CRON_BACKUP_FILE}, ${CRON_UPDATE_FILE}, ${CRON_HEALTHCHECK_FILE}, ${CRON_CAPACITY_FILE}, ${CRON_IDLE_FILE})"
+        echo "  Would remove:      logrotate config (${LOGROTATE_CONF})"
+        echo "  Would leave alone: fail2ban, Wine (not touched by uninstall)"
+        echo "  Data under ${GS_BASE}: you would be asked before this is deleted"
+        echo
+        echo -e "${C_BOLD}To proceed for real, re-run without --dry-run:${C_RESET}"
+        echo "  ./${SCRIPT_NAME} --uninstall"
+        echo
+        return 0
+    fi
+    # --- END DRY RUN ---
+
     init_logging "$LOG_FILE" "$SCRIPT_NAME"
     log_step "Uninstalling everything"
 
-    registry_ensure
     if [[ -f "$INSTANCE_REGISTRY" ]]; then
         while IFS=: read -r name game port _; do
             [[ -n "$name" ]] || continue
@@ -2809,10 +3000,19 @@ Options:
   --add-instance <name>      Add a shard of --game (prompts for its settings).
   --remove-instance <name>   Stop and remove one shard (asks before deleting data).
   --list-instances           List every configured shard, across all games.
+  --verbose                  With --list-instances, also show each shard's
+                              live status/uptime/memory/disk usage.
   --list-games                List every available game profile.
+  --validate-profile <game>   Check one profile file satisfies the platform's
+                               contract (required variables/functions), and
+                               exit. For contributors writing a new profile;
+                               doesn't need sudo, installs nothing.
   --uninstall                 Remove everything (asks before deleting data).
-  --status                    Show the health-check dashboard for all instances.
-  --dry-run                   Preview what add_instance WOULD do without doing it.
+  --status                    Show the health-check dashboard for all instances
+                               (run status-dashboard.sh directly with --json
+                               for machine-readable output).
+  --dry-run                   Preview what --add-instance, --remove-instance,
+                               or --uninstall WOULD do, without doing it.
   --version                   Print the script version and exit.
   -y, --yes                   Non-interactive: accept defaults / generate a
                                random password instead of prompting.
@@ -2934,6 +3134,8 @@ LIST_GAMES_MODE=0
 UNINSTALL_MODE=0
 CHECK_MODE=0
 STATUS_MODE=0
+VERBOSE_MODE=0    # when set to 1 via --verbose, --list-instances also shows live disk/RAM/uptime per instance
+VALIDATE_PROFILE_GAME=""  # set via --validate-profile <game>: standalone profile contract check, no install
 
 # parse_args: interprets every CLI option above.
 parse_args() {
@@ -2976,9 +3178,17 @@ parse_args() {
                 REMOVE_INSTANCE_NAME="$2"; shift
                 ;;
             --list-instances) LIST_INSTANCES_MODE=1 ;;
+            --verbose) VERBOSE_MODE=1 ;;
             --list-games) LIST_GAMES_MODE=1 ;;
             --uninstall) UNINSTALL_MODE=1 ;;
             --check) CHECK_MODE=1 ;;
+            --validate-profile)
+                if [[ -z "${2:-}" || "${2:0:1}" == "-" ]]; then
+                    echo "Error: --validate-profile requires a game id, e.g. --validate-profile terraria" >&2
+                    exit 1
+                fi
+                VALIDATE_PROFILE_GAME="$2"; shift
+                ;;
             -h|--help) print_usage; exit 0 ;;
             *) echo "Unknown option: $1" >&2; print_usage; exit 1 ;;
         esac
@@ -2994,6 +3204,11 @@ main() {
 
     if [[ "$CHECK_MODE" -eq 1 ]]; then
         run_environment_check "$GAME_ID"
+        return
+    fi
+
+    if [[ -n "$VALIDATE_PROFILE_GAME" ]]; then
+        validate_profile_standalone "$VALIDATE_PROFILE_GAME"
         return
     fi
 

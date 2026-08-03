@@ -7,11 +7,16 @@
 # port listening, uptime, disk), and a summary line at the bottom.
 #
 # Usage:
-#   status-dashboard.sh [instance-name]
-#     No argument  → show all instances
-#     With argument → show only the matching instance
+#   status-dashboard.sh [instance-name] [--json]
+#     No argument      → show all instances
+#     With name → show only the matching instance
+#     --json    → emit the same data as a single JSON object on stdout
+#                 instead of the human-readable table (no colors, no
+#                 boxes -- meant for scripts/monitoring, not eyeballs).
+#                 Can be combined with an instance-name filter, in
+#                 either argument order.
 #
-# Color coding:
+# Color coding (human mode only; --json never emits color codes):
 #   Green  = healthy (service running, port listening)
 #   Yellow = warning (recently started, within grace period)
 #   Red    = critical (service down, port not listening)
@@ -20,6 +25,21 @@
 # Checks:     systemctl is-active, ss -uln/-tln, du -sh
 ###############################################################################
 set -uo pipefail  # -u: error on unset variables; -o pipefail: pipeline error propagation
+
+###############################################################################
+# ARGUMENT PARSING
+# Accepts an optional instance-name filter and an optional --json flag, in
+# either order (e.g. "status-dashboard.sh --json myserver" or
+# "status-dashboard.sh myserver --json" both work).
+###############################################################################
+JSON_MODE=0   # 1 if --json was passed
+FILTER=""     # instance-name filter, if any non-flag argument was passed
+for arg in "$@"; do
+    case "$arg" in
+        --json) JSON_MODE=1 ;;
+        *) FILTER="$arg" ;;
+    esac
+done
 
 ###############################################################################
 # SOURCE SHARED LIBRARY
@@ -31,9 +51,10 @@ source /srv/gameservers/scripts/common.sh  # load shared functions and color cod
 ###############################################################################
 # COLOR DEFINITIONS (for dashboard-specific formatting)
 # These ANSI escape sequences let us color-code output for quick visual scans.
-# If stdout is NOT a terminal (e.g. piped to a file), they become empty strings.
+# If stdout is NOT a terminal (e.g. piped to a file), OR we're in --json
+# mode (JSON must never contain raw ANSI escapes), they become empty strings.
 ###############################################################################
-if [[ -t 1 ]]; then # check if stdout is a real terminal (file descriptor 1)
+if [[ -t 1 && "$JSON_MODE" -ne 1 ]]; then # real terminal AND not JSON mode
     CLR_RESET='\033[0m'       # reset all formatting back to default
     CLR_GREEN='\033[0;32m'    # green text for healthy/running status
     CLR_YELLOW='\033[0;33m'   # yellow text for warnings (recently started)
@@ -92,6 +113,9 @@ format_uptime() { # define the format_uptime function
 # Print the dashboard title with hostname, current date, and system uptime.
 # This gives the operator instant context about which machine they're looking at.
 ###############################################################################
+HOST_UPTIME="$(uptime -p 2>/dev/null || uptime | awk -F'up ' '{print $2}' | awk -F',' '{print $1}')" # human-readable host uptime
+
+if [[ "$JSON_MODE" -ne 1 ]]; then # human-readable header (skipped entirely in --json mode)
 echo ""  # print a blank line for visual spacing before the header
 echo -e "${CLR_BOLD}${CLR_CYAN}╔══════════════════════════════════════════════════════════════╗${CLR_RESET}" # top border
 echo -e "${CLR_BOLD}${CLR_CYAN}║           GAME SERVER PLATFORM — STATUS DASHBOARD           ║${CLR_RESET}" # title
@@ -101,15 +125,18 @@ echo ""  # blank line after the title box
 # Print the hostname on the left and the current date/time on the right
 printf "${CLR_BOLD}Host:${CLR_RESET} %s   " "$HOSTNAME"  # print the hostname in bold
 printf "${CLR_BOLD}Date:${CLR_RESET} %s\n" "$(date '+%Y-%m-%d %H:%M:%S')"  # print current date/time
-printf "${CLR_BOLD}Uptime:${CLR_RESET} %s\n" "$(uptime -p 2>/dev/null || uptime | awk -F'up ' '{print $2}' | awk -F',' '{print $1}')"
+printf "${CLR_BOLD}Uptime:${CLR_RESET} %s\n" "$HOST_UPTIME"
+fi # end of human-readable header
 
 ###############################################################################
 # SECTION: HOST RESOURCE OVERVIEW
 # Gather and display CPU load, RAM usage, and disk usage for the entire host.
 # These give a quick snapshot of whether the machine is healthy overall.
 ###############################################################################
+if [[ "$JSON_MODE" -ne 1 ]]; then # section header (skipped entirely in --json mode)
 echo ""  # blank line before host resources section
 echo -e "${CLR_BOLD}── Host Resources ──${CLR_RESET}"  # section header
+fi # end of section header
 
 # --- CPU LOAD ---
 # Read the 1-minute load average from /proc/loadavg (field 1).
@@ -128,8 +155,10 @@ else # load is below 70% (normal)
     LOAD_COLOR="$CLR_GREEN"    # green = healthy: CPU has headroom
 fi # end of load color decision
 
+if [[ "$JSON_MODE" -ne 1 ]]; then
 printf "  CPU:  ${LOAD_COLOR}%s%%${CLR_RESET} (load %s / %s cores)\n" \
     "$LOAD_PCT" "$LOAD_1M" "$CORES" # print CPU load with color and context
+fi
 
 # --- RAM USAGE ---
 # Parse /proc/meminfo for total and available memory, then compute usage %.
@@ -149,8 +178,10 @@ else # RAM usage is below warning threshold
     RAM_COLOR="$CLR_GREEN"    # green = healthy: plenty of RAM available
 fi # end of RAM color decision
 
+if [[ "$JSON_MODE" -ne 1 ]]; then
 printf "  RAM:  ${RAM_COLOR}%s%%${CLR_RESET} (%s MB / %s MB)\n" \
     "$RAM_PCT" "$RAM_USED_MB" "$RAM_TOTAL_MB" # print RAM usage with color and MB values
+fi
 
 # --- DISK USAGE ---
 # Use df to get the usage percentage and used/total for the filesystem containing /srv.
@@ -169,8 +200,10 @@ else # disk usage is below warning threshold
     DISK_COLOR="$CLR_GREEN"   # green = healthy: plenty of disk space
 fi # end of disk color decision
 
+if [[ "$JSON_MODE" -ne 1 ]]; then
 printf "  Disk: ${DISK_COLOR}%s%%${CLR_RESET} (%s used / %s total)\n" \
     "$DISK_PCT" "$DISK_USED" "$DISK_TOTAL" # print disk usage with color and space values
+fi
 
 ###############################################################################
 # SECTION: PER-INSTANCE STATUS TABLE
@@ -178,6 +211,7 @@ printf "  Disk: ${DISK_COLOR}%s%%${CLR_RESET} (%s used / %s total)\n" \
 # If an instance name was passed as $1, only show that one instance.
 # Otherwise, show all instances.
 ###############################################################################
+if [[ "$JSON_MODE" -ne 1 ]]; then
 echo ""  # blank line before the instance table
 echo -e "${CLR_BOLD}── Instance Status ──${CLR_RESET}"  # section header for the table
 
@@ -190,14 +224,20 @@ printf "${CLR_BOLD}%-22s %-14s %-10s %-8s %-10s %-12s %-10s${CLR_RESET}\n" \
 
 # Print a thin separator line under the headers using repeated dashes
 printf "${CLR_DIM}%s${CLR_RESET}\n" "$(printf '%.0s─' {1..90})"  # 90 dash characters
+fi
 
 ###############################################################################
 # INSTANCE ITERATION
 # Read instance names from the registry file. If a filter argument was given,
 # only process the matching instance. Otherwise, process all instances.
 # The registry format is: name:game:port:created_at (colon-separated).
+# (FILTER itself was already parsed out of "$@" at the top of the script,
+# alongside --json, so it isn't re-parsed here.)
 ###############################################################################
-FILTER="${1:-}" # store the first argument as the filter; empty string means "show all"
+
+# JSON_INSTANCES accumulates one jq-built JSON object per instance (only
+# used when JSON_MODE=1); combined into a single array right before output.
+JSON_INSTANCES=()
 
 # Counter variables for the summary line at the bottom
 COUNT_RUNNING=0  # how many instances are currently running
@@ -315,14 +355,87 @@ while IFS=: read -r reg_name reg_game reg_port _; do # read registry fields (4th
         COUNT_STOPPED=$(( COUNT_STOPPED + 1 )) # increment stopped counter
     fi # end of counter update
 
-    # --- PRINT THE ROW ---
-    # Use printf with fixed column widths to produce a clean table row.
-    # Each color variable wraps only the value, not the padding, so columns stay aligned.
-    # All args must be on lines joined by backslash so printf receives them all.
-    printf "%-22s %-14s ${SVC_COLOR}%-10s${CLR_RESET} %-8s ${PORT_COLOR}%-10s${CLR_RESET} ${UPTIME_COLOR}%-12s${CLR_RESET} ${INST_DISK_COLOR}%-10s${CLR_RESET}\n" \
-        "$reg_name" "$reg_game" "$SVC_STATUS" "$reg_port" "$PORT_STATUS" "$UPTIME_TEXT" "$DISK_USAGE"
+    if [[ "$JSON_MODE" -eq 1 ]]; then
+        # --- ACCUMULATE JSON ---
+        # Build one JSON object for this instance with jq -n (rather than
+        # hand-written string concatenation) so every field is properly
+        # escaped -- an instance/game name can't break the output no
+        # matter what characters it contains.
+        # uptime_seconds is only meaningful while running (ACTIVE_EPOCH
+        # otherwise defaults to 0, which would make UPTIME_SEC a huge,
+        # meaningless number of seconds since the epoch) -- report it as
+        # JSON null for a stopped instance instead.
+        json_uptime_seconds="null"
+        [[ "$SVC_STATUS" == "running" ]] && json_uptime_seconds="$UPTIME_SEC"
+        JSON_INSTANCES+=("$(jq -n \
+            --arg name "$reg_name" \
+            --arg game "$reg_game" \
+            --arg status "$SVC_STATUS" \
+            --argjson port "$reg_port" \
+            --argjson listening "$([[ "$PORT_STATUS" == "yes" ]] && echo true || echo false)" \
+            --argjson uptime_seconds "$json_uptime_seconds" \
+            --arg uptime "$UPTIME_TEXT" \
+            --arg disk_usage "$DISK_USAGE" \
+            '{name:$name, game:$game, status:$status, port:$port, listening:$listening, uptime_seconds:$uptime_seconds, uptime:$uptime, disk_usage:$disk_usage}')")
+    else
+        # --- PRINT THE ROW ---
+        # Use printf with fixed column widths to produce a clean table row.
+        # Each color variable wraps only the value, not the padding, so columns stay aligned.
+        # All args must be on lines joined by backslash so printf receives them all.
+        printf "%-22s %-14s ${SVC_COLOR}%-10s${CLR_RESET} %-8s ${PORT_COLOR}%-10s${CLR_RESET} ${UPTIME_COLOR}%-12s${CLR_RESET} ${INST_DISK_COLOR}%-10s${CLR_RESET}\n" \
+            "$reg_name" "$reg_game" "$SVC_STATUS" "$reg_port" "$PORT_STATUS" "$UPTIME_TEXT" "$DISK_USAGE"
+    fi
 
 done < "$INSTANCE_REGISTRY" # read lines from the registry file
+
+if [[ "$JSON_MODE" -eq 1 ]]; then
+    ###########################################################################
+    # SECTION: JSON OUTPUT
+    # Combine the host stats and every accumulated per-instance object into
+    # one JSON document and print it as the ENTIRE output of the script (no
+    # other stdout is produced in --json mode). "jq -s ." on the joined
+    # per-instance objects turns them into a proper JSON array; an empty
+    # array (no instances) is handled the same way.
+    ###########################################################################
+    instances_json="[]"
+    if [[ "${#JSON_INSTANCES[@]}" -gt 0 ]]; then
+        instances_json="$(printf '%s\n' "${JSON_INSTANCES[@]}" | jq -s '.')"
+    fi
+    jq -n \
+        --arg hostname "$HOSTNAME" \
+        --arg generated_at "$(date '+%Y-%m-%d %H:%M:%S')" \
+        --arg uptime "$HOST_UPTIME" \
+        --argjson cpu_pct "$LOAD_PCT" \
+        --argjson cpu_load_1m "$LOAD_1M" \
+        --argjson cpu_cores "$CORES" \
+        --argjson ram_pct "$RAM_PCT" \
+        --argjson ram_used_mb "$RAM_USED_MB" \
+        --argjson ram_total_mb "$RAM_TOTAL_MB" \
+        --argjson disk_pct "$DISK_PCT" \
+        --arg disk_used "$DISK_USED" \
+        --arg disk_total "$DISK_TOTAL" \
+        --argjson instances "$instances_json" \
+        --argjson running "$COUNT_RUNNING" \
+        --argjson stopped "$COUNT_STOPPED" \
+        --argjson total "$COUNT_TOTAL" \
+        '{
+            host: {
+                hostname: $hostname,
+                generated_at: $generated_at,
+                uptime: $uptime,
+                cpu: {pct: $cpu_pct, load_1m: $cpu_load_1m, cores: $cpu_cores},
+                ram: {pct: $ram_pct, used_mb: $ram_used_mb, total_mb: $ram_total_mb},
+                disk: {pct: $disk_pct, used: $disk_used, total: $disk_total}
+            },
+            instances: $instances,
+            summary: {running: $running, stopped: $stopped, total: $total}
+        }'
+    if [[ "$COUNT_STOPPED" -gt 0 ]]; then
+        exit 1
+    else
+        exit 0
+    fi
+fi
 
 ###############################################################################
 # SECTION: SUMMARY LINE

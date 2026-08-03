@@ -30,7 +30,7 @@ install.sh                          # Entry point — detects which installer to
 - **Automated backups** — per-instance cron jobs with configurable retention
 - **On-demand instances** — servers sleep when idle, wake on player connect (via sleep-listener)
 - **Health monitoring** — cron-based checks with auto-restart on failure
-- **Status dashboard** — `status-dashboard.sh` shows all instances at a glance
+- **Status dashboard** — `status-dashboard.sh` shows all instances at a glance (`--json` for scripting/monitoring)
 - **Discord notifications** — optional alerts for starts, stops, failures
 - **Golden installs** — shared game files downloaded once, symlinked into instances
 - **Per-instance config** — each instance gets its own settings, world data, and logs
