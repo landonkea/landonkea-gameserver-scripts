@@ -96,3 +96,22 @@ jobs:
           done
           exit $fail
           EOF
+
+      - name: Run profile smoke test (tests/profile_smoke_test.sh)
+        run: |
+          # Additive to the checks above, not a replacement: this runs the
+          # full contributor-facing smoke harness (bash -n + shellcheck -S
+          # error, unit tests, functional validate-config.sh cases, and a
+          # --validate-profile/--check --game pass over every profile) and
+          # writes its results to test-results/latest.md, uploaded below as
+          # a build artifact so a run's outcome is reviewable after the
+          # fact without re-running anything locally.
+          tests/profile_smoke_test.sh
+
+      - name: Upload smoke test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: profile-smoke-test-report
+          path: test-results/latest.md
+          if-no-files-found: warn

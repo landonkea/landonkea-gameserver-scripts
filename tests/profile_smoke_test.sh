@@ -42,12 +42,21 @@ COMMON_SH="${REPO_ROOT}/lib/common.sh"
 PASS_COUNT=0
 FAIL_COUNT=0
 FAILURES=()
+SHELLCHECK_OFFENSE_COUNT=0
 
 # pass/fail: the two primitives every check below reports through, so the
 # final summary is always accurate no matter how a given check is written.
 pass() { PASS_COUNT=$(( PASS_COUNT + 1 )); echo "  [ OK ] $1"; }
 fail() { FAIL_COUNT=$(( FAIL_COUNT + 1 )); FAILURES+=("$1"); echo "  [FAIL] $1"; }
 section() { echo; echo "=== $1 ==="; }
+
+# Report location: tests/../test-results/latest.md (gitignored -- generated
+# fresh on every run, not committed). REPORT_DIR is created up front so a
+# failure partway through this script still leaves a directory to write
+# into via the EXIT trap below.
+REPORT_DIR="${REPO_ROOT}/test-results"
+REPORT_FILE="${REPORT_DIR}/latest.md"
+mkdir -p "$REPORT_DIR"
 
 MOCK_BIN="$(mktemp -d)"
 SANDBOX="$(mktemp -d)"
@@ -125,7 +134,12 @@ else
         else
             pass "bash -n: ${rel}"
         fi
-        if ! shellcheck -s bash -S error "$f" > /dev/null 2>&1; then
+        sc_out="$(shellcheck -s bash -S error -f gcc "$f" 2>/dev/null)"
+        sc_rc=$?
+        if [[ -n "$sc_out" ]]; then
+            SHELLCHECK_OFFENSE_COUNT=$(( SHELLCHECK_OFFENSE_COUNT + $(wc -l <<< "$sc_out") ))
+        fi
+        if [[ "$sc_rc" -ne 0 ]]; then
             fail "shellcheck -S error: ${rel}"
         else
             pass "shellcheck -S error: ${rel}"
@@ -152,7 +166,12 @@ if [[ -s "$VALIDATE_CONFIG_TEMPLATE" ]]; then
         fail "bash -n: extracted validate-config.sh template"
     fi
     if command -v shellcheck > /dev/null 2>&1; then
-        if shellcheck -s bash -S error "$VALIDATE_CONFIG_TEMPLATE" > /dev/null 2>&1; then
+        sc_out="$(shellcheck -s bash -S error -f gcc "$VALIDATE_CONFIG_TEMPLATE" 2>/dev/null)"
+        sc_rc=$?
+        if [[ -n "$sc_out" ]]; then
+            SHELLCHECK_OFFENSE_COUNT=$(( SHELLCHECK_OFFENSE_COUNT + $(wc -l <<< "$sc_out") ))
+        fi
+        if [[ "$sc_rc" -eq 0 ]]; then
             pass "shellcheck -S error: extracted validate-config.sh template"
         else
             fail "shellcheck -S error: extracted validate-config.sh template"
@@ -480,6 +499,47 @@ if [[ "$FAIL_COUNT" -gt 0 ]]; then
     for f in "${FAILURES[@]}"; do
         echo "  - $f"
     done
+fi
+
+###############################################################################
+# Persisted report: test-results/latest.md -- machine- and human-readable
+# summary of this run (total/pass/fail counts, timestamp, shellcheck offense
+# count, and the full failure list if any), written regardless of pass/fail
+# so CI can upload it as a build artifact even on a red run.
+###############################################################################
+TOTAL_COUNT=$(( PASS_COUNT + FAIL_COUNT ))
+TIMESTAMP="$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+STATUS="PASS"
+[[ "$FAIL_COUNT" -gt 0 ]] && STATUS="FAIL"
+
+{
+    echo "# profile_smoke_test.sh report"
+    echo
+    echo "- **Status:** ${STATUS}"
+    echo "- **Timestamp:** ${TIMESTAMP}"
+    echo "- **Total checks:** ${TOTAL_COUNT}"
+    echo "- **Passed:** ${PASS_COUNT}"
+    echo "- **Failed:** ${FAIL_COUNT}"
+    echo "- **ShellCheck offenses (-S error):** ${SHELLCHECK_OFFENSE_COUNT}"
+    echo "- **Mode:** $([[ "$QUICK" -eq 1 ]] && echo "--quick (per-profile loop skipped)" || echo "full")"
+    echo
+    if [[ "$FAIL_COUNT" -gt 0 ]]; then
+        echo "## Failures"
+        echo
+        for f in "${FAILURES[@]}"; do
+            echo "- ${f}"
+        done
+    else
+        echo "## Failures"
+        echo
+        echo "None."
+    fi
+} > "$REPORT_FILE"
+
+echo
+echo "Report written to: ${REPORT_FILE}"
+
+if [[ "$FAIL_COUNT" -gt 0 ]]; then
     exit 1
 fi
 exit 0

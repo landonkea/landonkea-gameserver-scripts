@@ -76,7 +76,10 @@ bash -n profiles/yourgame.profile.sh          # syntax
   Pass `--quick` to skip the slower per-profile loop. It does **not**
   replace the real-VM checklist above (Wine, SteamCMD, real systemd still
   need an actual disposable Ubuntu box) — it only proves what can be proven
-  without one.
+  without one. Every run also writes a Markdown summary (total/pass/fail
+  counts, timestamp, ShellCheck offense count, and the full failure list if
+  any) to `test-results/latest.md` — gitignored locally, and uploaded as a
+  CI build artifact on every push/PR run.
 - `bash -n` every file you touched (no syntax errors).
 - If you touched the core framework (`install-game-server.sh` or
   `install-valheim-server.sh`), re-run `--list-games` (platform) or a full
