@@ -101,6 +101,60 @@ ts() { # define the timestamp function
     date '+%Y-%m-%d %H:%M:%S' # format: year-month-day hour:minute:second
 } # end of ts()
 
+# json_escape(): escapes a string for safe embedding inside a JSON string
+# value -- backslash and double-quote first (order matters: escaping the
+# backslash first avoids double-escaping the backslash just inserted in
+# front of each quote), then newlines/tabs/carriage returns turned into
+# their JSON escape sequences so a message containing any of those can
+# never break the one-line-per-record JSON Lines format below. Deliberately
+# hand-rolled with bash's own string substitution (no jq/python dependency)
+# because this must work from the very first log line of a run, before
+# install_packages has necessarily installed jq yet.
+json_escape() { # define the json_escape function
+    local s="$1" # the raw, unescaped string
+    s="${s//\\/\\\\}" # backslash -> \\ (must run before the quote substitution below)
+    s="${s//\"/\\\"}"  # double-quote -> \"
+    s="${s//$'\n'/\\n}" # newline -> \n
+    s="${s//$'\r'/\\r}" # carriage return -> \r
+    s="${s//$'\t'/\\t}" # tab -> \t
+    printf '%s' "$s" # print the escaped result (captured by the caller via command substitution)
+} # end of json_escape()
+
+# jsonl_log_path(): prints the structured-log path derived from the
+# current LOG_FILE -- "/var/log/gameserver-install.log" becomes
+# "/var/log/gameserver-install.jsonl", living alongside the human-readable
+# log rather than replacing it. Computed fresh on every call (instead of
+# cached in a variable) so it always tracks LOG_FILE even if a caller
+# changes LOG_FILE after sourcing this file (init_logging does exactly
+# that).
+jsonl_log_path() { # define the jsonl_log_path function
+    if [[ "$LOG_FILE" == *.log ]]; then # the common case: LOG_FILE ends in ".log"
+        echo "${LOG_FILE%.log}.jsonl" # swap the ".log" suffix for ".jsonl"
+    else # LOG_FILE doesn't end in ".log" for some reason -- just append instead
+        echo "${LOG_FILE}.jsonl" # append ".jsonl" rather than guessing at a suffix to replace
+    fi # end of the suffix check
+} # end of jsonl_log_path()
+
+# log_json_line(): appends one machine-readable JSON object (as a single
+# line -- this is the "JSON Lines" / .jsonl convention: one whole, valid
+# JSON document per line, so the file can be tailed/streamed and parsed
+# line-by-line without ever needing to read the whole file into memory
+# first) to the structured log file, mirroring every log_info/log_ok/
+# log_warn/log_err/log_step call in this file. Exists for anyone building
+# external tooling on top of an install run (a CI step, a dashboard, a
+# log-shipping agent) that wants structured fields instead of scraping
+# colored, human-oriented text. Like log_line, this must never itself
+# abort the calling script -- same reasoning, same "2>/dev/null first,
+# || true second" double safety net (see log_line's own comment above
+# for the full explanation of why the ordering matters).
+log_json_line() { # define the log_json_line function
+    local level="$1" message="$2" # the severity word (INFO/OK/WARN/ERROR/STEP) and the human message
+    {
+        printf '{"ts":"%s","level":"%s","message":"%s"}\n' \
+            "$(ts)" "$(json_escape "$level")" "$(json_escape "$message")"
+    } 2>/dev/null >> "$(jsonl_log_path)" || true
+} # end of log_json_line()
+
 # log_line(): appends one plain-text line to the log file.
 # Must never itself cause the calling script to abort (every log_* function
 # is called constantly, including before we've gained root -- e.g.
@@ -131,6 +185,7 @@ log_line() { # define the log_line function
 log_info() { # define the log_info function
     echo -e "${C_BLUE}[INFO]${C_RESET} $1" # print blue "[INFO]" + message to terminal
     log_line "INFO: $1"                     # also append to the log file
+    log_json_line "INFO" "$1"               # also append a structured JSON line
 } # end of log_info()
 
 # log_ok(): prints a green [ OK ] message to the terminal (stdout).
@@ -139,6 +194,7 @@ log_info() { # define the log_info function
 log_ok() { # define the log_ok function
     echo -e "${C_GREEN}[ OK ]${C_RESET} $1" # print green "[ OK ]" + message to terminal
     log_line "OK: $1"                         # also append to the log file
+    log_json_line "OK" "$1"                   # also append a structured JSON line
 } # end of log_ok()
 
 # log_warn(): prints a yellow [WARN] message to stderr (not stdout).
@@ -148,6 +204,7 @@ log_ok() { # define the log_ok function
 log_warn() { # define the log_warn function
     echo -e "${C_YELLOW}[WARN]${C_RESET} $1" >&2 # print yellow "[WARN]" to stderr
     log_line "WARN: $1"                            # also append to the log file
+    log_json_line "WARN" "$1"                      # also append a structured JSON line
 } # end of log_warn()
 
 # log_err(): prints a red [FAIL] message to stderr.
@@ -157,6 +214,7 @@ log_warn() { # define the log_warn function
 log_err() { # define the log_err function
     echo -e "${C_RED}[FAIL]${C_RESET} $1" >&2 # print red "[FAIL]" to stderr
     log_line "ERROR: $1"                        # also append to the log file
+    log_json_line "ERROR" "$1"                  # also append a structured JSON line
 } # end of log_err()
 
 # log_step(): prints a bold section header like "==> Installing packages".
@@ -165,6 +223,7 @@ log_err() { # define the log_err function
 log_step() { # define the log_step function
     echo -e "\n${C_BOLD}==> $1${C_RESET}" # print a blank line + bold "==> section name"
     log_line "STEP: $1"                     # also append to the log file
+    log_json_line "STEP" "$1"               # also append a structured JSON line
 } # end of log_step()
 
 ###############################################################################

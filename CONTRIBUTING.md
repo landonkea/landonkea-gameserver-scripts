@@ -64,6 +64,19 @@ bash -n profiles/yourgame.profile.sh          # syntax
 
 ## Before submitting a change
 
+- Run `tests/profile_smoke_test.sh` from the repo root. This formalizes the
+  sandboxed mock environment mentioned above (fake `systemctl`/`ss`/
+  `journalctl`, no root, nothing outside a temp directory touched) into one
+  command: `bash -n` + `shellcheck -S error` on every script (including the
+  `validate-config.sh` template, which only exists as a heredoc inside
+  `install-game-server.sh` until install time), unit tests for the
+  JSON-lines logger and the port-conflict resolver, functional pass/fail
+  cases for `validate-config.sh` against synthetic configs, and a
+  `--validate-profile`/`--check --game` pass over every bundled profile.
+  Pass `--quick` to skip the slower per-profile loop. It does **not**
+  replace the real-VM checklist above (Wine, SteamCMD, real systemd still
+  need an actual disposable Ubuntu box) — it only proves what can be proven
+  without one.
 - `bash -n` every file you touched (no syntax errors).
 - If you touched the core framework (`install-game-server.sh` or
   `install-valheim-server.sh`), re-run `--list-games` (platform) or a full

@@ -331,6 +331,50 @@ registry_next_port() {
     echo "$candidate" # the caller captures this via command substitution: $(registry_next_port)
 }
 
+# port_block_free: true (0) if all PROFILE_PORT_COUNT consecutive ports
+# starting at $1 are free right now according to `ss` (nothing already
+# listening on any of them). This only checks the LIVE host state -- it
+# says nothing about whether the block is registered to another instance
+# (registry_next_port already handles that separately); combining both is
+# what makes find_free_port below actually reliable. If `ss` isn't
+# installed at all, this optimistically returns true (can't check, so
+# don't block on it) -- validate_port still catches a genuinely
+# out-of-range port either way.
+port_block_free() {
+    local start="$1" count="${PROFILE_PORT_COUNT:-1}" i port
+    command_exists ss || return 0
+    local ss_output; ss_output="$(ss -uln 2>/dev/null; ss -tln 2>/dev/null)"
+    for (( i=0; i<count; i++ )); do
+        port=$(( start + i ))
+        grep -q ":${port}[[:space:]]" <<< "$ss_output" && return 1
+    done
+    return 0
+}
+
+# find_free_port: starting from $1, steps forward by PORT_RANGE_STEP
+# (checking each candidate against the live `ss` state via
+# port_block_free) until it finds a block that's actually free, or gives
+# up after a generous number of tries. This is the auto-suggest half of
+# the pre-flight port-conflict resolver: turning "port already in use,
+# please retry" into "here's a port that should actually work" instead of
+# leaving the operator to manually guess-and-check a replacement by hand.
+find_free_port() {
+    local candidate="$1" max_tries=500 tries=0
+    while (( tries < max_tries )); do
+        if port_block_free "$candidate"; then
+            echo "$candidate"
+            return 0
+        fi
+        candidate=$(( candidate + PORT_RANGE_STEP ))
+        tries=$(( tries + 1 ))
+    done
+    # Gave up without finding a free block (extremely unlikely in
+    # practice) -- fall back to the original candidate; validate_port will
+    # still enforce the valid numeric range, and the ss-based warning below
+    # will still fire so the operator isn't left with a silent conflict.
+    echo "$1"
+}
+
 # registry_add: appends "name:game:port:timestamp". Uses a colon-free
 # timestamp format (unlike ts()) since the registry itself uses ':' as its
 # field separator.
@@ -921,6 +965,23 @@ gather_generic_instance_input() {
 
     local suggested_port
     suggested_port="$(registry_next_port)"
+    # Pre-flight port-conflict resolver: registry_next_port already avoids
+    # colliding with this platform's OWN registered instances, but says
+    # nothing about a port something else on the host (a different
+    # service entirely, or a leftover process from before this platform
+    # was even installed) is already listening on. Rather than offering
+    # that busy port as the default and letting the operator discover the
+    # conflict only after typing it in (the old behavior: prompt, THEN
+    # warn, then make them manually retry with a guessed replacement),
+    # check it up front and swap in an already-free suggestion instead.
+    if ! port_block_free "$suggested_port"; then
+        local auto_suggested_port
+        auto_suggested_port="$(find_free_port "$suggested_port")"
+        if [[ "$auto_suggested_port" != "$suggested_port" ]]; then
+            log_warn "Port ${suggested_port} (the next registry slot) already appears to be in use on this machine; suggesting ${auto_suggested_port} instead."
+            suggested_port="$auto_suggested_port"
+        fi
+    fi
     prompt_and_validate "Base port for this instance (uses ${PROFILE_PORT_COUNT} consecutive port(s))" "$suggested_port" validate_port SERVER_PORT 0
     if command_exists ss; then
         # `ss -uln` lists listening (-l) UDP (-u) sockets in numeric form
@@ -935,7 +996,28 @@ gather_generic_instance_input() {
         # number avoids a false match against a longer port number that
         # merely starts with the same digits (e.g. searching for ":80"
         # shouldn't match ":8080").
-        grep -q ":${SERVER_PORT}[[:space:]]" <<< "$ss_output" && log_warn "Port ${SERVER_PORT} already appears to be in use on this machine."
+        if grep -q ":${SERVER_PORT}[[:space:]]" <<< "$ss_output"; then
+            # The operator typed (or accepted a default landing on) a port
+            # that's busy after all -- e.g. they overrode the suggestion
+            # above, or something started listening on it between the
+            # check above and now. Rather than leaving them to manually
+            # guess-and-check a replacement, compute one now and either
+            # apply it automatically (non-interactive mode) or re-prompt
+            # with it pre-filled as the new default (interactive mode, so
+            # accepting it is just pressing Enter).
+            local retry_suggested_port
+            retry_suggested_port="$(find_free_port "$SERVER_PORT")"
+            log_warn "Port ${SERVER_PORT} already appears to be in use on this machine."
+            if [[ "$retry_suggested_port" != "$SERVER_PORT" ]]; then
+                if [[ "$ASSUME_DEFAULTS" -eq 1 ]]; then
+                    log_warn "Non-interactive mode: automatically switching to the next free port, ${retry_suggested_port}."
+                    SERVER_PORT="$retry_suggested_port"
+                else
+                    log_warn "Suggesting ${retry_suggested_port} instead (the next free block found)."
+                    prompt_and_validate "Base port for this instance (uses ${PROFILE_PORT_COUNT} consecutive port(s))" "$retry_suggested_port" validate_port SERVER_PORT 0
+                fi
+            fi
+        fi
     fi
 
     # Profile-specific prompts (world name, max players, password, etc.)
@@ -2275,6 +2357,194 @@ EOF
     log_ok "Sleep-listener template installed at ${SYSTEMD_SLEEP_TEMPLATE_UNIT_PATH}."
 }
 
+# write_validate_config_script: writes scripts/validate-config.sh
+# <instance-name> -- config schema validation / drift detection. Re-runs
+# each GENERIC field's exact original prompt-time validator (the same
+# functions gather_generic_instance_input used when the instance was
+# first configured) against whatever is CURRENTLY on disk in that
+# instance's config.env, so a config hand-edited (or corrupted, or
+# left over from an older version of this platform) into something no
+# longer valid is caught by a clear, explicit check -- instead of silently
+# misbehaving the next time a cron job (backup/update/healthcheck) reads
+# it, at 3am, with nobody watching.
+#
+# Scope note: the GENERIC fields below (instance name, port, backup
+# dir/retention/time, update time, Discord webhook, on-demand flag) are
+# ones this platform's OWN prompt flow writes, with a known, fixed
+# validator function for each -- those get the real, original check.
+# Profile-specific fields (PROFILE_EXTRA_CONFIG_VARS, e.g. a world name or
+# max-player count) have no such mapping recorded anywhere in the profile
+# contract (see PROFILE-AUTHORING.md) -- a profile's own
+# profile_gather_prompts is free to call whatever validator it likes, by
+# name, with no requirement to expose which validator went with which
+# variable afterward. Re-implementing that per-field for all 29+ profiles
+# would mean changing the profile contract itself, which is a bigger
+# change than this one script should make silently -- so those instead
+# get a best-effort generic check: present, and free of the same
+# shell-metacharacter corruption has_forbidden_chars guards against
+# everywhere else in this codebase.
+write_validate_config_script() {
+    cat > "${SCRIPTS_DIR}/validate-config.sh" << 'EOF'
+#!/usr/bin/env bash
+# validate-config.sh <instance-name> -- config schema validation / drift
+# detection. Re-checks the current on-disk config.env against the same
+# validators used when the instance was first configured. Read-only:
+# never modifies config.env. Exit 0 if every check passes, 1 otherwise.
+set -uo pipefail
+source /srv/gameservers/scripts/common.sh
+
+target="${1:-}"
+if [[ -z "$target" ]]; then
+    echo "Usage: $0 <instance-name>" >&2
+    list_instance_names_to_stderr
+    exit 1
+fi
+
+cfg="/srv/gameservers/instances/${target}/config.env"
+if [[ ! -f "$cfg" ]]; then
+    log_err "No instance named '${target}' (looked for ${cfg})."
+    list_instance_names_to_stderr
+    exit 1
+fi
+
+# --- Duplicated validator functions -----------------------------------
+# Duplicated here (rather than sourced from the main installer) for the
+# same reason curl_with_retry is duplicated in common.sh above: this
+# script runs standalone, long after install-game-server.sh itself may
+# have been deleted from this machine, so it can't assume that file still
+# exists to source from.
+has_forbidden_chars() {
+    case "$1" in
+        *'"'*|*"'"*|*'`'*|*'\'*|*'$'*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+validate_instance_name() {
+    [[ "$1" =~ ^[A-Za-z0-9_-]{1,32}$ ]] || { echo "must be 1-32 characters: letters, numbers, '_', '-' (no spaces)"; return 1; }
+    return 0
+}
+validate_port() {
+    local v="$1" needed="${PROFILE_PORT_COUNT:-1}"
+    [[ "$v" =~ ^[0-9]+$ ]] || { echo "must be a whole number"; return 1; }
+    (( v >= 1024 && v + needed <= 65535 )) || { echo "must be between 1024 and $((65535 - needed)) (this game uses ${needed} consecutive port(s))"; return 1; }
+    return 0
+}
+validate_retention_days() {
+    [[ "$1" =~ ^[0-9]+$ ]] && (( $1 >= 1 && $1 <= 365 )) || { echo "must be a whole number of days between 1 and 365"; return 1; }
+    return 0
+}
+validate_time_hhmm() {
+    [[ "$1" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]] || { echo "must be 24-hour HH:MM, e.g. 03:30"; return 1; }
+    return 0
+}
+validate_backup_dir() {
+    local v="$1"
+    has_forbidden_chars "$v" && { echo "may not contain: \" ' \` \\ \$"; return 1; }
+    [[ "$v" == /* ]] || { echo "must be an absolute path (starting with /)"; return 1; }
+    if [[ -n "${CURRENT_INSTANCE_DATA_DIR:-}" ]] && { [[ "$v" == "$CURRENT_INSTANCE_DATA_DIR" ]] || [[ "$v" == "$CURRENT_INSTANCE_DATA_DIR"/* ]]; }; then
+        echo "must not be inside this instance's data directory (${CURRENT_INSTANCE_DATA_DIR})"
+        return 1
+    fi
+    return 0
+}
+validate_discord_webhook_url() {
+    local v="$1"
+    [[ -z "$v" ]] && return 0
+    has_forbidden_chars "$v" && { echo "may not contain: \" ' \` \\ \$"; return 1; }
+    [[ "$v" == https://discord.com/api/webhooks/* ]] || { echo "must be a Discord webhook URL (https://discord.com/api/webhooks/...), or blank"; return 1; }
+    return 0
+}
+# ------------------------------------------------------------------------
+
+# Syntax-check config.env BEFORE sourcing it -- a truncated or otherwise
+# corrupted config.env (e.g. an interrupted write, or a bad manual edit)
+# could abort THIS script under set -u the moment it's sourced, instead
+# of being reported as a clean, specific failure like everything else
+# below.
+if ! bash -n "$cfg" 2>/dev/null; then
+    log_err "[${target}] config.env has a bash syntax error -- cannot even be safely loaded. Run: bash -n ${cfg}"
+    exit 1
+fi
+
+# shellcheck source=/dev/null
+source "$cfg"
+
+fail=0
+check() { # check <label> <status-0-or-1> <detail-if-failed>
+    if [[ "$2" -eq 0 ]]; then
+        log_ok "[${target}] ${1}: OK"
+    else
+        log_err "[${target}] ${1}: ${3}"
+        fail=1
+    fi
+}
+
+# Directory name vs. the config's own recorded INSTANCE_NAME -- catches a
+# renamed/copied instance directory whose config.env was never updated to
+# match.
+if [[ "${INSTANCE_NAME:-}" != "$target" ]]; then
+    log_err "[${target}] INSTANCE_NAME field: config.env says '${INSTANCE_NAME:-<unset>}', but this instance's directory is '${target}'."
+    fail=1
+else
+    errmsg="$(validate_instance_name "${INSTANCE_NAME:-}" 2>&1)"; check "INSTANCE_NAME" "$?" "$errmsg"
+fi
+
+if [[ -z "${GAME:-}" ]]; then
+    log_err "[${target}] GAME field: unset -- config.env is missing GAME=\"<game_id>\"."
+    fail=1
+elif [[ ! -f "/srv/gameservers/scripts/profiles/${GAME}.profile.sh" ]]; then
+    log_err "[${target}] GAME field: '${GAME}' has no matching installed profile at /srv/gameservers/scripts/profiles/${GAME}.profile.sh."
+    fail=1
+else
+    log_ok "[${target}] GAME field: OK ('${GAME}', profile installed)"
+    # shellcheck source=/dev/null
+    source "/srv/gameservers/scripts/profiles/${GAME}.profile.sh"
+
+    errmsg="$(validate_port "${SERVER_PORT:-}" 2>&1)"; check "SERVER_PORT" "$?" "$errmsg"
+
+    CURRENT_INSTANCE_DATA_DIR="/srv/gameservers/instances/${target}/data"
+    errmsg="$(validate_backup_dir "${BACKUP_DIR:-}" 2>&1)"; check "BACKUP_DIR" "$?" "$errmsg"
+    errmsg="$(validate_retention_days "${BACKUP_RETENTION_DAYS:-}" 2>&1)"; check "BACKUP_RETENTION_DAYS" "$?" "$errmsg"
+    errmsg="$(validate_time_hhmm "${BACKUP_TIME:-}" 2>&1)"; check "BACKUP_TIME" "$?" "$errmsg"
+    errmsg="$(validate_time_hhmm "${UPDATE_TIME:-}" 2>&1)"; check "UPDATE_TIME" "$?" "$errmsg"
+    errmsg="$(validate_discord_webhook_url "${DISCORD_WEBHOOK_URL:-}" 2>&1)"; check "DISCORD_WEBHOOK_URL" "$?" "$errmsg"
+
+    if [[ "${ON_DEMAND:-}" =~ ^[01]$ ]]; then
+        log_ok "[${target}] ON_DEMAND field: OK"
+    else
+        log_err "[${target}] ON_DEMAND field: '${ON_DEMAND:-<unset>}' -- must be exactly 0 or 1."
+        fail=1
+    fi
+
+    # Profile-specific fields: best-effort generic check only (see this
+    # script's header comment for why a real per-field validator isn't
+    # available here).
+    for varname in "${PROFILE_EXTRA_CONFIG_VARS[@]:-}"; do
+        [[ -n "$varname" ]] || continue
+        value="${!varname:-}"
+        if has_forbidden_chars "$value"; then
+            log_err "[${target}] ${varname} (profile field): contains a shell-unsafe character (\" ' \` \\ \$) -- likely manual corruption."
+            fail=1
+        elif [[ -z "$value" ]]; then
+            log_warn "[${target}] ${varname} (profile field): empty. May be intentional (e.g. an optional password) -- not treated as a failure, but worth a manual look."
+        else
+            log_ok "[${target}] ${varname} (profile field): present, no unsafe characters (not re-checked against its original, game-specific validator -- see this script's header comment)."
+        fi
+    done
+fi
+
+if [[ "$fail" -eq 0 ]]; then
+    log_ok "[${target}] All checks passed."
+    exit 0
+else
+    log_err "[${target}] One or more checks FAILED -- see above. Fix config.env directly, or re-run --remove-instance then re-add."
+    exit 1
+fi
+EOF
+    chmod 750 "${SCRIPTS_DIR}/validate-config.sh"
+    chown "$GS_USER:$GS_GROUP" "${SCRIPTS_DIR}/validate-config.sh"
+}
+
 # write_all_helper_scripts: generates every helper script in one call.
 write_all_helper_scripts() {
     log_step "Generating helper and monitoring scripts"
@@ -2292,6 +2562,7 @@ write_all_helper_scripts() {
     write_wake_instance_script
     write_idle_monitor_script
     write_status_dashboard_script
+    write_validate_config_script
     log_ok "Helper scripts written to ${SCRIPTS_DIR}/"
 }
 
@@ -3007,6 +3278,10 @@ Options:
                                contract (required variables/functions), and
                                exit. For contributors writing a new profile;
                                doesn't need sudo, installs nothing.
+  --validate-config <name>    Re-check an existing shard's config.env against
+                               the same validators used when it was first
+                               configured -- catches a hand-edited or
+                               corrupted config before a cron job hits it.
   --uninstall                 Remove everything (asks before deleting data).
   --status                    Show the health-check dashboard for all instances
                                (run status-dashboard.sh directly with --json
@@ -3136,6 +3411,7 @@ CHECK_MODE=0
 STATUS_MODE=0
 VERBOSE_MODE=0    # when set to 1 via --verbose, --list-instances also shows live disk/RAM/uptime per instance
 VALIDATE_PROFILE_GAME=""  # set via --validate-profile <game>: standalone profile contract check, no install
+VALIDATE_CONFIG_INSTANCE=""  # set via --validate-config <instance>: config drift-detection check, no install
 
 # parse_args: interprets every CLI option above.
 parse_args() {
@@ -3189,6 +3465,13 @@ parse_args() {
                 fi
                 VALIDATE_PROFILE_GAME="$2"; shift
                 ;;
+            --validate-config)
+                if [[ -z "${2:-}" || "${2:0:1}" == "-" ]]; then
+                    echo "Error: --validate-config requires an instance name, e.g. --validate-config myworld" >&2
+                    exit 1
+                fi
+                VALIDATE_CONFIG_INSTANCE="$2"; shift
+                ;;
             -h|--help) print_usage; exit 0 ;;
             *) echo "Unknown option: $1" >&2; print_usage; exit 1 ;;
         esac
@@ -3213,6 +3496,14 @@ main() {
     fi
 
     require_root "$@"
+
+    if [[ -n "$VALIDATE_CONFIG_INSTANCE" ]]; then
+        if [[ -x "${SCRIPTS_DIR}/validate-config.sh" ]]; then
+            exec "${SCRIPTS_DIR}/validate-config.sh" "$VALIDATE_CONFIG_INSTANCE"
+        else
+            die "validate-config.sh not found at ${SCRIPTS_DIR}/validate-config.sh. Run the installer first (--add-instance at least once)."
+        fi
+    fi
 
     if [[ "$UNINSTALL_MODE" -eq 1 ]]; then
         uninstall_everything
