@@ -1,0 +1,57 @@
+# docker/docker-compose.yml -- example compose file for the containerized
+# runtime option. See docker/README.md for what this is (and isn't) an
+# alternative to.
+#
+# Usage:
+#   cd docker
+#   docker compose up -d openttd        # just OpenTTD
+#   docker compose up -d minecraft      # just Minecraft (reads EULA below first!)
+#   docker compose up -d                # both
+#
+# Both services are independent -- comment out (or `docker compose up -d
+# <service>` only) whichever one you don't want running.
+
+services:
+  openttd:
+    build:
+      context: ./openttd
+    container_name: openttd
+    restart: unless-stopped
+    ports:
+      - "3979:3979/tcp"
+      - "3979:3979/udp"
+    volumes:
+      - openttd-data:/data
+    environment:
+      SERVER_NAME: "My OpenTTD Server"
+      SERVER_PORT: "3979"
+      MAX_CLIENTS: "8"
+      SERVER_PASSWORD: ""
+
+  minecraft:
+    build:
+      context: ./minecraft
+    container_name: minecraft
+    restart: unless-stopped
+    ports:
+      - "25565:25565/tcp"
+      - "25575:25575/tcp"
+    volumes:
+      - minecraft-data:/data
+    environment:
+      # You must read and accept https://www.minecraft.net/eula and set
+      # this to "true" yourself -- it does NOT default to accepted.
+      EULA: "false"
+      SERVER_PORT: "25565"
+      RCON_PORT: "25575"
+      MAX_PLAYERS: "20"
+      MOTD: "A Minecraft Server"
+      DIFFICULTY: "easy"
+      GAMEMODE: "survival"
+      JAVA_HEAP_GB: "2"
+      # Blank disables RCON entirely. Set a real password to enable it.
+      RCON_PASSWORD: ""
+
+volumes:
+  openttd-data:
+  minecraft-data:

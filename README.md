@@ -8,6 +8,13 @@ ARK: Survival Ascended, ARK: Survival Evolved, Arma 3, Astroneer, Conan Exiles, 
 
 Plus a standalone **Valheim** installer with extended backup/restore and status monitoring features.
 
+There is also an [additive, containerized runtime option](docker/README.md)
+(Docker/Podman) for two of these games -- OpenTTD and Minecraft -- for
+anyone who wants a single containerized instance instead of a host install.
+It's a smaller alternative, not a replacement: it has no backups, monitoring,
+Discord alerts, or multi-instance management. The host-based installer below
+remains the primary, full-featured path.
+
 ## Architecture
 
 ```
@@ -18,8 +25,12 @@ install.sh                          # Entry point — detects which installer to
 │   ├── profiles/*.profile.sh       # 29 game-specific config files
 │   └── scripts/
 │       └── status-dashboard.sh     # Unified health-check dashboard
-└── valheim/
-    └── install-valheim-server.sh   # Valheim-specific installer
+├── valheim/
+│   └── install-valheim-server.sh   # Valheim-specific installer
+└── docker/                         # Additive containerized runtime (OpenTTD, Minecraft only)
+    ├── openttd/Dockerfile
+    ├── minecraft/Dockerfile
+    └── docker-compose.yml
 ```
 
 ## Features

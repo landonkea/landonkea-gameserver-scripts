@@ -1,0 +1,83 @@
+name: Docker container build & smoke test
+
+# Additive CI job for the containerized runtime option under docker/ --
+# does NOT touch or replace syntax-check.yml (shellcheck / profile-contract
+# gate for the host-based installer). Only runs when docker/ files change,
+# so it never slows down or blocks unrelated PRs.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "docker/**"
+      - ".github/workflows/docker-build.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "docker/**"
+      - ".github/workflows/docker-build.yml"
+
+jobs:
+  build-and-smoke-test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - game: openttd
+            port: 3979
+            proto: tcp
+          - game: minecraft
+            port: 25565
+            proto: tcp
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v7
+
+      - name: Build the ${{ matrix.game }} image
+        run: docker build -t ${{ matrix.game }}-ci ./docker/${{ matrix.game }}
+
+      - name: Start the ${{ matrix.game }} container
+        run: |
+          if [ "${{ matrix.game }}" = "minecraft" ]; then
+            docker run -d --name ${{ matrix.game }}-ci \
+              -e EULA=true \
+              -p ${{ matrix.port }}:${{ matrix.port }}/${{ matrix.proto }} \
+              ${{ matrix.game }}-ci
+          else
+            docker run -d --name ${{ matrix.game }}-ci \
+              -p ${{ matrix.port }}:${{ matrix.port }}/${{ matrix.proto }} \
+              ${{ matrix.game }}-ci
+          fi
+
+      - name: Wait for the server process to start and the port to open
+        run: |
+          # Poll for up to 90 seconds -- Minecraft's world generation on
+          # first boot is the slowest part of either image's startup.
+          ok=0
+          for i in $(seq 1 30); do
+            if docker exec ${{ matrix.game }}-ci ss -tlnp 2>/dev/null | grep -q ":${{ matrix.port }} "; then
+              ok=1
+              break
+            fi
+            if ! docker ps --filter "name=${{ matrix.game }}-ci" --filter "status=running" -q | grep -q .; then
+              echo "::error::Container exited early"
+              docker logs ${{ matrix.game }}-ci || true
+              exit 1
+            fi
+            sleep 3
+          done
+          if [ "$ok" -ne 1 ]; then
+            echo "::error::Port ${{ matrix.port }} never opened inside the container"
+            docker logs ${{ matrix.game }}-ci || true
+            exit 1
+          fi
+          echo "OK: ${{ matrix.game }} is listening on port ${{ matrix.port }}"
+          docker exec ${{ matrix.game }}-ci ss -tulnp
+
+      - name: Show container logs (always, for debugging)
+        if: always()
+        run: docker logs ${{ matrix.game }}-ci || true
+
+      - name: Clean up
+        if: always()
+        run: docker rm -f ${{ matrix.game }}-ci || true
