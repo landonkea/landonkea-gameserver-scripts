@@ -41,6 +41,7 @@ install.sh                          # Entry point — detects which installer to
 - **Automated backups** — per-instance cron jobs with configurable retention
 - **On-demand instances** — servers sleep when idle, wake on player connect (via sleep-listener)
 - **Health monitoring** — cron-based checks with auto-restart on failure
+- **Crash simulation** — `--simulate-crash <instance>` deliberately breaks an instance and proves the auto-restart + Discord-alert loop actually recovers it
 - **Status dashboard** — `status-dashboard.sh` shows all instances at a glance (`--json` for scripting/monitoring)
 - **Discord notifications** — optional alerts for starts, stops, failures
 - **Golden installs** — shared game files downloaded once, symlinked into instances
@@ -60,7 +61,32 @@ sudo /srv/gameservers/scripts/status-dashboard.sh
 
 # Health-check a specific instance
 sudo /srv/gameservers/scripts/healthcheck-instance.sh myinstance
+
+# Test the auto-restart + Discord-alert safety loop for real
+sudo ./install-game-server.sh --simulate-crash myinstance
 ```
+
+## Testing the auto-restart safety loop (`--simulate-crash`)
+
+Health monitoring and Discord alerts only matter if they actually work when
+something really breaks -- and the only way to know for sure is to break
+something on purpose. `--simulate-crash <instance>` does exactly that: it
+deliberately stops (or, with `--crash-mode kill`, SIGKILLs) a real running
+instance, runs the actual `healthcheck-instance.sh` against it, and reports
+PASS or FAIL depending on whether the instance came back up on its own --
+using the exact same code path a real crash would trigger, not a simulation
+of it.
+
+```bash
+sudo ./install-game-server.sh --simulate-crash myinstance
+sudo ./install-game-server.sh --simulate-crash myinstance --crash-mode kill
+sudo ./install-game-server.sh --simulate-crash myinstance --no-notify        # skip the real Discord POST
+sudo ./install-game-server.sh --simulate-crash myinstance --crash-timeout 90 # allow more time to recover
+```
+
+Only run it against an instance you're OK restarting right now -- it's a
+real crash, not a dry run, and requires root for the same reason
+`healthcheck-instance.sh` does.
 
 ## Discord Notifications (optional)
 

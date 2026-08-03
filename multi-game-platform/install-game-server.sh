@@ -1209,9 +1209,17 @@ load_instance() {
 }
 
 # notify_discord: posts $1 to DISCORD_WEBHOOK_URL if one is configured for
-# the currently loaded instance; a complete no-op otherwise.
+# the currently loaded instance; a complete no-op otherwise. If
+# GAMESERVER_NOTIFY_DRY_RUN=1 is set in the environment, the message is
+# logged instead of actually posted -- used by simulate-crash.sh's
+# --no-notify option so a contributor can test the auto-restart path
+# repeatedly without spamming a real Discord channel every time.
 notify_discord() {
     local message="$1"
+    if [[ "${GAMESERVER_NOTIFY_DRY_RUN:-0}" == "1" ]]; then
+        log_info "[dry-run] Would notify Discord: ${message}"
+        return 0
+    fi
     if [[ -n "${DISCORD_WEBHOOK_URL:-}" ]]; then
         local payload
         payload="$(printf '%s' "$message" | jq -Rs '{content: .}')"
@@ -2022,6 +2030,138 @@ EOF
     chown "$GS_USER:$GS_GROUP" "${SCRIPTS_DIR}/healthcheck-instance.sh"
 }
 
+# write_simulate_crash_script: writes scripts/simulate-crash.sh
+# <instance-name> [--mode=stop|kill] [--no-notify] [--timeout=N]. This is a
+# TEST MODE for the auto-restart + Discord-alert safety loop that
+# healthcheck-instance.sh implements: instead of trusting the loop works
+# because the code "looks right", an operator can deliberately take a real
+# instance down and watch (or script an assertion around) whether it truly
+# comes back on its own and whether the alert fires -- the same thing a
+# real crash would exercise, on demand, instead of waiting for one.
+write_simulate_crash_script() {
+    cat > "${SCRIPTS_DIR}/simulate-crash.sh" << 'EOF'
+#!/usr/bin/env bash
+# simulate-crash.sh <instance-name> [--mode=stop|kill] [--no-notify] [--timeout=N]
+set -uo pipefail
+source /srv/gameservers/scripts/common.sh
+
+MODE="stop"        # stop: systemctl stop (clean); kill: SIGKILL the main PID (harsher, closer to a real crash)
+NO_NOTIFY=0         # 1 = suppress the real Discord POST for this run (still logs what would have been sent)
+TIMEOUT=60          # seconds to wait for auto-recovery before declaring FAIL
+target=""
+
+for arg in "$@"; do
+    case "$arg" in
+        --mode=*) MODE="${arg#--mode=}" ;;
+        --no-notify) NO_NOTIFY=1 ;;
+        --timeout=*) TIMEOUT="${arg#--timeout=}" ;;
+        -*) echo "Unknown option: ${arg}" >&2; exit 2 ;;
+        *) target="$arg" ;;
+    esac
+done
+
+if [[ -z "$target" ]]; then
+    echo "Usage: $0 <instance-name> [--mode=stop|kill] [--no-notify] [--timeout=N]" >&2
+    list_instance_names_to_stderr
+    exit 1
+fi
+
+if [[ $EUID -ne 0 ]]; then
+    echo "ERROR: simulate-crash.sh must run as root -- it stops/kills a real systemd-managed process and then relies on the same root-only auto-restart path healthcheck-instance.sh uses in production." >&2
+    exit 1
+fi
+
+case "$MODE" in
+    stop|kill) ;;
+    *) echo "ERROR: --mode must be 'stop' or 'kill' (got '${MODE}')." >&2; exit 2 ;;
+esac
+
+if [[ ! "$TIMEOUT" =~ ^[0-9]+$ ]] || [[ "$TIMEOUT" -lt 1 ]]; then
+    echo "ERROR: --timeout must be a positive integer number of seconds (got '${TIMEOUT}')." >&2
+    exit 2
+fi
+
+if [[ ! -f "${INSTANCES_DIR}/${target}/config.env" ]]; then
+    echo "ERROR: no instance named '${target}' (looked for ${INSTANCES_DIR}/${target}/config.env)." >&2
+    list_instance_names_to_stderr
+    exit 1
+fi
+
+load_instance "$target"
+
+echo "=== simulate-crash: [${target}] (mode=${MODE}, timeout=${TIMEOUT}s) ==="
+
+if ! systemctl is-active --quiet "gameserver@${target}"; then
+    echo "[${target}] is not currently running -- starting it first so the crash simulation has something real to kill."
+    systemctl start "gameserver@${target}"
+    sleep 5
+    if ! systemctl is-active --quiet "gameserver@${target}"; then
+        echo "FAIL: [${target}] would not start at all, independent of this test -- fix the instance itself before simulating a crash on it." >&2
+        exit 1
+    fi
+fi
+
+echo "Inducing a simulated crash..."
+if [[ "$MODE" == "kill" ]]; then
+    main_pid="$(systemctl show "gameserver@${target}" --property=MainPID --value 2>/dev/null || echo 0)"
+    if [[ "$main_pid" =~ ^[0-9]+$ ]] && [[ "$main_pid" -gt 0 ]]; then
+        echo "Sending SIGKILL to MainPID ${main_pid}..."
+        kill -KILL "$main_pid" 2>/dev/null || true
+        # Give systemd a moment to notice the process is gone and mark the
+        # unit failed before we check/act on its state below.
+        sleep 3
+    else
+        echo "Could not determine a MainPID for gameserver@${target}; falling back to 'systemctl stop'."
+        systemctl stop "gameserver@${target}"
+    fi
+else
+    systemctl stop "gameserver@${target}"
+fi
+
+sleep 2
+if systemctl is-active --quiet "gameserver@${target}"; then
+    echo "FAIL: [${target}] is still reported active immediately after the simulated crash -- there's nothing for the healthcheck to detect. (systemd may have already auto-restarted it via its own Restart= setting before this script's healthcheck pass got a turn -- that's not a failure of THIS feature, but it means this run can't tell you anything new.)" >&2
+    exit 1
+fi
+echo "Confirmed [${target}] is down. Running the real healthcheck-instance.sh to exercise the actual auto-restart + alert path (not a re-implementation of it)..."
+
+if [[ "$NO_NOTIFY" -eq 1 ]]; then
+    export GAMESERVER_NOTIFY_DRY_RUN=1
+    echo "(--no-notify: the Discord alert will be logged, not actually posted)"
+fi
+"${SCRIPTS_DIR}/healthcheck-instance.sh" "$target"
+healthcheck_rc=$?
+unset GAMESERVER_NOTIFY_DRY_RUN
+
+echo "Waiting up to ${TIMEOUT}s for [${target}] to come back up on its own..."
+recovered=0
+elapsed=0
+while [[ "$elapsed" -lt "$TIMEOUT" ]]; do
+    if systemctl is-active --quiet "gameserver@${target}"; then
+        recovered=1
+        break
+    fi
+    sleep 2
+    elapsed=$(( elapsed + 2 ))
+done
+
+echo
+if [[ "$recovered" -eq 1 ]]; then
+    echo "RESULT: PASS -- [${target}] was automatically restarted after the simulated crash (recovered in ~${elapsed}s)."
+    if [[ "$healthcheck_rc" -ne 0 ]]; then
+        echo "NOTE: healthcheck-instance.sh exited non-zero (${healthcheck_rc}) -- that's expected here, it reports the pre-restart failure it found and then fixed, not the outcome after fixing it."
+    fi
+    exit 0
+else
+    echo "RESULT: FAIL -- [${target}] did NOT come back up within ${TIMEOUT}s." >&2
+    echo "Check: 'systemctl status gameserver@${target}', 'journalctl -u gameserver@${target} -n 50', and that the healthcheck cron job (${SCRIPTS_DIR}/healthcheck-instance.sh) is actually installed and running as root." >&2
+    exit 1
+fi
+EOF
+    chmod 750 "${SCRIPTS_DIR}/simulate-crash.sh"
+    chown "$GS_USER:$GS_GROUP" "${SCRIPTS_DIR}/simulate-crash.sh"
+}
+
 # write_monitoring_scripts: writes the CPU/RAM/disk/SMART/network helpers.
 write_monitoring_scripts() {
     cat > "${SCRIPTS_DIR}/cpu-status.sh" << 'EOF'
@@ -2556,6 +2696,7 @@ write_all_helper_scripts() {
     write_restore_script
     write_update_script
     write_healthcheck_script
+    write_simulate_crash_script
     write_monitoring_scripts
     write_host_capacity_monitor_script
     write_sleep_listener_script
@@ -3282,6 +3423,20 @@ Options:
                                the same validators used when it was first
                                configured -- catches a hand-edited or
                                corrupted config before a cron job hits it.
+  --simulate-crash <name>     Test the auto-restart + Discord-alert safety
+                               loop for real: deliberately stops (or, with
+                               --crash-mode kill, SIGKILLs) the instance,
+                               then runs the actual healthcheck script and
+                               reports PASS/FAIL on whether it came back on
+                               its own. Requires root; asks nothing, just
+                               does it -- only run this against an instance
+                               you're OK restarting right now.
+  --crash-mode <stop|kill>    With --simulate-crash: how to induce the
+                               failure (default: stop).
+  --crash-timeout <seconds>   With --simulate-crash: how long to wait for
+                               auto-recovery before reporting FAIL (default: 60).
+  --no-notify                 With --simulate-crash: log what the Discord
+                               alert would say instead of actually posting it.
   --uninstall                 Remove everything (asks before deleting data).
   --status                    Show the health-check dashboard for all instances
                                (run status-dashboard.sh directly with --json
@@ -3412,6 +3567,10 @@ STATUS_MODE=0
 VERBOSE_MODE=0    # when set to 1 via --verbose, --list-instances also shows live disk/RAM/uptime per instance
 VALIDATE_PROFILE_GAME=""  # set via --validate-profile <game>: standalone profile contract check, no install
 VALIDATE_CONFIG_INSTANCE=""  # set via --validate-config <instance>: config drift-detection check, no install
+SIMULATE_CRASH_INSTANCE=""  # set via --simulate-crash <instance>: test the auto-restart/alert safety loop for real
+CRASH_MODE="stop"           # --crash-mode stop|kill, passed through to simulate-crash.sh
+CRASH_TIMEOUT="60"          # --crash-timeout <seconds>, passed through to simulate-crash.sh
+CRASH_NO_NOTIFY=0           # 1 if --no-notify was given alongside --simulate-crash
 
 # parse_args: interprets every CLI option above.
 parse_args() {
@@ -3472,6 +3631,28 @@ parse_args() {
                 fi
                 VALIDATE_CONFIG_INSTANCE="$2"; shift
                 ;;
+            --simulate-crash)
+                if [[ -z "${2:-}" || "${2:0:1}" == "-" ]]; then
+                    echo "Error: --simulate-crash requires an instance name, e.g. --simulate-crash myworld" >&2
+                    exit 1
+                fi
+                SIMULATE_CRASH_INSTANCE="$2"; shift
+                ;;
+            --crash-mode)
+                if [[ -z "${2:-}" || "${2:0:1}" == "-" ]]; then
+                    echo "Error: --crash-mode requires a value, e.g. --crash-mode kill" >&2
+                    exit 1
+                fi
+                CRASH_MODE="$2"; shift
+                ;;
+            --crash-timeout)
+                if [[ -z "${2:-}" || ! "${2}" =~ ^[0-9]+$ ]]; then
+                    echo "Error: --crash-timeout requires a positive integer number of seconds" >&2
+                    exit 1
+                fi
+                CRASH_TIMEOUT="$2"; shift
+                ;;
+            --no-notify) CRASH_NO_NOTIFY=1 ;;
             -h|--help) print_usage; exit 0 ;;
             *) echo "Unknown option: $1" >&2; print_usage; exit 1 ;;
         esac
@@ -3502,6 +3683,16 @@ main() {
             exec "${SCRIPTS_DIR}/validate-config.sh" "$VALIDATE_CONFIG_INSTANCE"
         else
             die "validate-config.sh not found at ${SCRIPTS_DIR}/validate-config.sh. Run the installer first (--add-instance at least once)."
+        fi
+    fi
+
+    if [[ -n "$SIMULATE_CRASH_INSTANCE" ]]; then
+        if [[ -x "${SCRIPTS_DIR}/simulate-crash.sh" ]]; then
+            local -a crash_args=("$SIMULATE_CRASH_INSTANCE" "--mode=${CRASH_MODE}" "--timeout=${CRASH_TIMEOUT}")
+            [[ "$CRASH_NO_NOTIFY" -eq 1 ]] && crash_args+=("--no-notify")
+            exec "${SCRIPTS_DIR}/simulate-crash.sh" "${crash_args[@]}"
+        else
+            die "simulate-crash.sh not found at ${SCRIPTS_DIR}/simulate-crash.sh. Run the installer first (--add-instance at least once)."
         fi
     fi
 
