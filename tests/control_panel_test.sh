@@ -180,7 +180,14 @@ TOKEN="$(echo "$SETUP_OUT" | awk '/^   [0-9a-f]{64}$/ {print $1; exit}')"
 if [[ -f "$CONF_FILE" ]]; then pass "setup-control-panel.sh --enable wrote ${CONF_FILE}"; else fail "setup-control-panel.sh --enable did not write a config file"; fi
 if grep -q '^CONTROL_PANEL_ENABLED=1' "$CONF_FILE" 2>/dev/null; then pass "config file has CONTROL_PANEL_ENABLED=1"; else fail "config file missing CONTROL_PANEL_ENABLED=1"; fi
 if [[ "${#TOKEN}" -eq 64 ]]; then pass "a 64-hex-char token was generated and printed"; else fail "could not extract a 64-char token from setup output: ${SETUP_OUT}"; fi
-if [[ "$(stat -f '%Lp' "$CONF_FILE" 2>/dev/null || stat -c '%a' "$CONF_FILE" 2>/dev/null)" == "600" ]]; then
+# GNU stat (-c, real Ubuntu target + CI) tried first, BSD/macOS stat
+# (-f) as a local-dev-on-Mac fallback. Order matters: GNU stat's "-f"
+# flag means something different (filesystem status, not file mode)
+# and doesn't fail cleanly on an unrecognized %Lp directive -- it just
+# prints something that isn't "600" -- so putting the BSD form first
+# silently reported "not mode 600" on every Linux/CI run regardless
+# of the real (correct) permissions.
+if [[ "$(stat -c '%a' "$CONF_FILE" 2>/dev/null || stat -f '%Lp' "$CONF_FILE" 2>/dev/null)" == "600" ]]; then
     pass "config file is mode 600"
 else
     fail "config file is not mode 600"
