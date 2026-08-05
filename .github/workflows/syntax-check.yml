@@ -80,9 +80,20 @@ jobs:
           # required fails loudly here, in an automated check, rather
           # than being discovered later by a person running it for real.
           cd multi-game-platform
-          sed 's/^readonly //' install-game-server.sh > /tmp/ci-check.sh
+          # WHY THIS MUST STAY IN multi-game-platform/, NOT /tmp:
+          # install-game-server.sh locates its own directory via
+          # `BASE_DIR="$(dirname "${BASH_SOURCE[0]}")"` and sources
+          # lib/common.sh relative to that ("${BASE_DIR}/../lib/common.sh")
+          # -- correct for its real deployed location, but if this
+          # readonly-stripped copy were written to /tmp instead,
+          # BASH_SOURCE[0] would resolve to /tmp and the relative
+          # lib/common.sh lookup would fail ("/tmp/../lib/common.sh: No
+          # such file or directory"). Writing the copy alongside the real
+          # script keeps BASE_DIR resolving to the real multi-game-platform/
+          # directory, so ../lib/common.sh correctly finds the real file.
+          sed 's/^readonly //' install-game-server.sh > ./.ci-check.sh
           bash << 'EOF'
-          source /tmp/ci-check.sh
+          source ./.ci-check.sh
           trap - ERR
           PROFILES_DIR="$(pwd)/profiles"
           fail=0
@@ -96,6 +107,7 @@ jobs:
           done
           exit $fail
           EOF
+          rm -f ./.ci-check.sh
 
       - name: Run profile smoke test (tests/profile_smoke_test.sh)
         run: |
