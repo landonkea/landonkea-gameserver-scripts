@@ -29,6 +29,12 @@ jobs:
           - game: minecraft
             port: 25565
             proto: tcp
+          - game: factorio
+            port: 34197
+            proto: udp
+          - game: mindustry
+            port: 6567
+            proto: tcp
     steps:
       - name: Check out the repository
         uses: actions/checkout@v7
@@ -55,7 +61,7 @@ jobs:
           # first boot is the slowest part of either image's startup.
           ok=0
           for i in $(seq 1 30); do
-            if docker exec ${{ matrix.game }}-ci ss -tlnp 2>/dev/null | grep -q ":${{ matrix.port }} "; then
+            if docker exec ${{ matrix.game }}-ci ss -tulnp 2>/dev/null | grep -q ":${{ matrix.port }} "; then
               ok=1
               break
             fi

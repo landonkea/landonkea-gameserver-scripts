@@ -6,10 +6,12 @@
 #   cd docker
 #   docker compose up -d openttd        # just OpenTTD
 #   docker compose up -d minecraft      # just Minecraft (reads EULA below first!)
-#   docker compose up -d                # both
+#   docker compose up -d factorio       # just Factorio
+#   docker compose up -d mindustry      # just Mindustry
+#   docker compose up -d                # all four
 #
-# Both services are independent -- comment out (or `docker compose up -d
-# <service>` only) whichever one you don't want running.
+# All services are independent -- comment out (or `docker compose up -d
+# <service>` only) whichever ones you don't want running.
 
 services:
   openttd:
@@ -52,6 +54,42 @@ services:
       # Blank disables RCON entirely. Set a real password to enable it.
       RCON_PASSWORD: ""
 
+  factorio:
+    build:
+      context: ./factorio
+    container_name: factorio
+    restart: unless-stopped
+    ports:
+      - "34197:34197/udp"
+    volumes:
+      - factorio-data:/data
+    environment:
+      SERVER_NAME: "My Factorio Server"
+      SERVER_PORT: "34197"
+      MAX_PLAYERS: "0"
+      SERVER_PASSWORD: ""
+      SAVE_NAME: "world"
+
+  mindustry:
+    build:
+      context: ./mindustry
+    container_name: mindustry
+    restart: unless-stopped
+    ports:
+      - "6567:6567/tcp"
+      - "6567:6567/udp"
+    volumes:
+      - mindustry-data:/data
+    environment:
+      SERVER_NAME: "My Mindustry Server"
+      SERVER_PORT: "6567"
+      # Blank = "host" picks a random built-in map (see mindustry/entrypoint.sh).
+      MAP: ""
+      MODE: "survival"
+      JAVA_HEAP_GB: "1"
+
 volumes:
   openttd-data:
   minecraft-data:
+  factorio-data:
+  mindustry-data:
