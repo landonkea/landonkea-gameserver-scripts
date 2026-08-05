@@ -24,7 +24,10 @@ install.sh                          # Entry point — detects which installer to
 │   ├── install-game-server.sh      # Core multi-game installer (systemd, cron, backups, on-demand)
 │   ├── profiles/*.profile.sh       # 29 game-specific config files
 │   └── scripts/
-│       └── status-dashboard.sh     # Unified health-check dashboard
+│       ├── status-dashboard.sh     # Unified health-check dashboard
+│       ├── control-panel.py        # Optional read-write web control panel (off by default)
+│       ├── control-panel-instance-action.sh  # Root-only start/stop/restart, called only by control-panel.py
+│       └── setup-control-panel.sh  # The only way to opt into the control panel
 ├── valheim/
 │   ├── install-valheim-server.sh   # Valheim-specific installer
 │   └── manage-mods.sh              # Thunderstore mod manager for Valheim shards
@@ -116,6 +119,72 @@ The webhook URL is per-instance (not a single global setting), stored in
 that instance's `config.env` alongside its other settings -- the same file
 already used for the server password and backup schedule, and it's
 `chmod 600` for the same reason: only root can read it.
+
+## Web Control Panel (optional, off by default, security-sensitive)
+
+A small, dependency-free web UI (Python 3 standard library only) that shows
+live status for every instance and can start/stop/restart them from a
+browser. **It is not exposed by default** -- installing the platform writes
+the control panel's files to `/srv/gameservers/scripts/`, but the server
+refuses every start/stop/restart request until you explicitly opt in.
+
+**What it can do:** view status (read-only, always available once the
+server is running) and start/stop/restart any registered instance
+(read-write, requires the admin token below). It cannot add/remove
+instances, change any instance's configuration, or run arbitrary commands.
+
+**Enable it:**
+
+```bash
+sudo /srv/gameservers/scripts/setup-control-panel.sh --enable
+```
+
+This generates a random 64-character admin token (`openssl rand -hex 32`),
+writes it to `/srv/gameservers/control-panel.conf` (`chmod 600`,
+root-owned), prints the token to your terminal **exactly once**, and
+installs + starts a systemd service (`gameserver-control-panel.service`)
+listening on `127.0.0.1:8642` by default. Save the token now -- it is never
+shown again (rotate instead if you lose it). Running the script with no
+flags asks interactively instead (default: declined, nothing enabled).
+
+Open `http://127.0.0.1:8642/` (or tunnel/proxy that port to wherever you're
+sitting -- the server has no TLS of its own and isn't meant to be put
+directly on the public internet), paste the token into the "Admin token"
+field, and click a start/stop/restart button.
+
+**Auth, in short:** every action request must include
+`Authorization: Bearer <token>`. There is no other way in -- the token is
+never accepted via a URL query string (so it never ends up in an access
+log), and actions are POST-only (so a plain cross-site form can't trigger
+one; a script would need to know the token and deliberately set that
+header). Every attempt, successful or not, is written to
+`/srv/gameservers/control-panel-audit.log`.
+
+**Rotate the token:**
+
+```bash
+sudo /srv/gameservers/scripts/setup-control-panel.sh --rotate
+```
+
+The old token stops working immediately; a new one is printed once, same
+as above.
+
+**Disable it again:**
+
+```bash
+sudo /srv/gameservers/scripts/setup-control-panel.sh --disable
+```
+
+The service is stopped; any previously-issued token is left in the config
+file but becomes inert (every action request gets refused) until you
+`--enable` or `--rotate` again.
+
+See `multi-game-platform/scripts/control-panel.py`'s module docstring for
+the full security model and reasoning, and
+`tests/control_panel_test.sh` for the functional test that exercises both
+the rejection paths (no token / wrong token / GET instead of POST / query
+string token) and the success path (a valid token genuinely starts/stops/
+restarts the target instance) against a real running server.
 
 ## Requirements
 

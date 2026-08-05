@@ -115,3 +115,15 @@ jobs:
           name: profile-smoke-test-report
           path: test-results/latest.md
           if-no-files-found: warn
+
+      - name: Run web control panel functional test (tests/control_panel_test.sh)
+        run: |
+          # The read-write web control panel (opt-in, off by default -- see
+          # multi-game-platform/scripts/control-panel.py and
+          # setup-control-panel.sh) has its own dedicated functional test:
+          # starts the real server against a mocked systemctl, and proves
+          # both the auth-rejection paths (403/401/405 before/without a
+          # valid token) and the auth-success path (a valid token genuinely
+          # starts/stops/restarts the mocked instance) actually work, not
+          # just that the code looks right.
+          tests/control_panel_test.sh

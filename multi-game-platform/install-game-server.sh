@@ -2471,6 +2471,95 @@ DASHEOF
     chown "$GS_USER:$GS_GROUP" "${SCRIPTS_DIR}/status-dashboard.sh"
 }
 
+# write_control_panel_scripts: writes scripts/control-panel-instance-action.sh
+# and scripts/control-panel.py -- the OFF-BY-DEFAULT read-write web control
+# panel. Installing these files does NOT turn anything on: the control
+# panel refuses every action until an operator explicitly opts in by
+# running scripts/setup-control-panel.sh --enable (see that script and
+# control-panel.py's own module docstring for the full security model).
+# Same dual-path pattern as write_status_dashboard_script above: copy the
+# real, independently-shellcheck-able file out of this repo's own scripts/
+# directory when available (dev/CI), falling back to an inline heredoc
+# copy only if that source file is missing (e.g. this installer script was
+# copied out on its own, without the rest of the repo).
+write_control_panel_scripts() {
+    local action_src="${BASE_DIR}/scripts/control-panel-instance-action.sh"
+    local panel_src="${BASE_DIR}/scripts/control-panel.py"
+    local setup_src="${BASE_DIR}/scripts/setup-control-panel.sh"
+
+    if [[ -f "$action_src" ]]; then
+        cp "$action_src" "${SCRIPTS_DIR}/control-panel-instance-action.sh"
+    else
+        cat > "${SCRIPTS_DIR}/control-panel-instance-action.sh" << 'ACTIONEOF'
+#!/usr/bin/env bash
+# control-panel-instance-action.sh <start|stop|restart> <instance-name>
+# Root-only. See the full, commented version of this file in this
+# platform's own repository (multi-game-platform/scripts/) for the
+# complete explanation of every check here -- this is a minimal fallback
+# used only when this installer script is run standalone, without the
+# rest of the repository alongside it.
+set -uo pipefail
+GS_BASE="${CONTROL_PANEL_GS_BASE:-/srv/gameservers}"
+INSTANCES_DIR="${GS_BASE}/instances"
+if [[ "${EUID}" -ne 0 && "${CONTROL_PANEL_ACTION_ALLOW_NONROOT:-0}" != "1" ]]; then
+    echo "ERROR: control-panel-instance-action.sh must run as root." >&2
+    exit 2
+fi
+action="${1:-}"; name="${2:-}"
+case "$action" in
+    start|stop|restart) ;;
+    *) echo "ERROR: action must be one of: start, stop, restart (got '${action}')." >&2; exit 1 ;;
+esac
+if [[ ! "$name" =~ ^[A-Za-z0-9_-]+$ ]]; then
+    echo "ERROR: invalid instance name '${name}'." >&2
+    exit 1
+fi
+if [[ ! -f "${INSTANCES_DIR}/${name}/config.env" ]]; then
+    echo "ERROR: no instance named '${name}'." >&2
+    exit 1
+fi
+on_demand="0"
+grep -q '^ON_DEMAND=1' "${INSTANCES_DIR}/${name}/config.env" 2>/dev/null && on_demand="1"
+unit="gameserver@${name}"; sleep_unit="gameserver-sleep@${name}"
+wake_if_sleeping() {
+    if [[ "$on_demand" == "1" ]] && systemctl is-active --quiet "$sleep_unit" 2>/dev/null; then
+        systemctl stop "$sleep_unit" 2>/dev/null || true
+    fi
+}
+case "$action" in
+    start) wake_if_sleeping; systemctl start "$unit"; sleep 1 ;;
+    stop) systemctl stop "$unit"; systemctl stop "$sleep_unit" 2>/dev/null || true; sleep 1 ;;
+    restart) wake_if_sleeping; systemctl restart "$unit"; sleep 1 ;;
+esac
+state="$(systemctl is-active "$unit" 2>/dev/null || true)"
+echo "instance=${name} action=${action} unit_state=${state}"
+if [[ "$action" == "stop" ]]; then
+    [[ "$state" != "active" ]] && exit 0
+    echo "ERROR: ${unit} is still active after stop." >&2; exit 3
+else
+    [[ "$state" == "active" ]] && exit 0
+    echo "ERROR: ${unit} did not become active after ${action}." >&2; exit 3
+fi
+ACTIONEOF
+    fi
+    chmod 750 "${SCRIPTS_DIR}/control-panel-instance-action.sh"
+    chown root:root "${SCRIPTS_DIR}/control-panel-instance-action.sh"
+
+    if [[ -f "$panel_src" ]]; then
+        cp "$panel_src" "${SCRIPTS_DIR}/control-panel.py"
+        chmod 750 "${SCRIPTS_DIR}/control-panel.py"
+        chown root:root "${SCRIPTS_DIR}/control-panel.py"
+    else
+        log_warn "control-panel.py not found alongside this installer -- the web control panel will not be available until it's placed at ${SCRIPTS_DIR}/control-panel.py."
+    fi
+
+    if [[ -f "$setup_src" ]]; then
+        cp "$setup_src" "${SCRIPTS_DIR}/setup-control-panel.sh"
+        chmod 750 "${SCRIPTS_DIR}/setup-control-panel.sh"
+        chown root:root "${SCRIPTS_DIR}/setup-control-panel.sh"
+    fi
+}
+
 # install_systemd_sleep_template: writes the sleep-listener's template
 # unit. Restart=on-failure (not "always") is deliberate -- see the
 # confidence note in write_sleep_listener_script.
@@ -2703,6 +2792,7 @@ write_all_helper_scripts() {
     write_wake_instance_script
     write_idle_monitor_script
     write_status_dashboard_script
+    write_control_panel_scripts
     write_validate_config_script
     log_ok "Helper scripts written to ${SCRIPTS_DIR}/"
 }
