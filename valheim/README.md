@@ -138,6 +138,64 @@ the cap; it doesn't repeal Valheim's underlying architecture.
 
 ---
 
+## Installing Additional Mods (`manage-mods.sh`)
+
+`install-valheim-server.sh` only ever touches Thunderstore for one reason:
+raising the player cap above 10 (BepInEx + MaxPlayerCount, above). For
+everything else in Thunderstore's Valheim mod catalog, use
+`manage-mods.sh` — it lives alongside the installer in this same
+directory and manages any shard the installer created.
+
+```bash
+chmod +x manage-mods.sh
+
+# Search Thunderstore's Valheim catalog (read-only, never needs root):
+./manage-mods.sh search "portal"
+
+# Install a mod by <namespace/name> onto a shard (as shown by 'search',
+# or from the mod's own Thunderstore page URL). Installs BepInEx first,
+# automatically, if this shard doesn't already have it (e.g. a vanilla,
+# max-players-10 shard that never triggered the installer's own BepInEx
+# path):
+./manage-mods.sh install Azumatt/Where_You_At main
+
+# Pin a specific version instead of "latest":
+./manage-mods.sh install Azumatt/Where_You_At main 1.0.10
+
+# See what's installed on a shard:
+./manage-mods.sh list main
+
+# Remove a mod:
+./manage-mods.sh remove Azumatt/Where_You_At main
+
+# List every shard manage-mods.sh knows about:
+./manage-mods.sh list-instances
+```
+
+A few things worth knowing:
+
+- **Mod names are case-sensitive**, given as `<namespace/name>` exactly as
+  Thunderstore shows them (e.g. `Azumatt/Where_You_At`, not
+  `azumatt/where_you_at`).
+- Each installed mod gets its own subfolder under that shard's
+  `server/BepInEx/plugins/<namespace>-<name>/`, and is recorded in a
+  per-shard `mods.registry` file (so `list`/`remove` never have to guess
+  at what's on disk).
+- `install`/`list`/`remove` touch `/srv/valheim` and auto-elevate with
+  `sudo`, same as every other script here — you don't need to type `sudo`
+  yourself. `search` is Thunderstore-API-only and never needs root.
+- **You must restart the shard** (`restart-valheim.sh <name>`) for an
+  install or removal to actually take effect — `manage-mods.sh` only
+  touches files, it never restarts the game process for you.
+- The full Valheim mod catalog (~150MB+ of JSON) is cached locally and
+  only re-downloaded once a day, so repeated `search` calls stay fast.
+- If a mod's package doesn't contain a `.dll` after install, you're warned
+  rather than left thinking it worked silently — some Thunderstore
+  packages are translation/config/asset-only add-ons for another mod,
+  not standalone BepInEx plugins.
+
+---
+
 ## Directory Layout
 
 ```

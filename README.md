@@ -26,7 +26,8 @@ install.sh                          # Entry point — detects which installer to
 │   └── scripts/
 │       └── status-dashboard.sh     # Unified health-check dashboard
 ├── valheim/
-│   └── install-valheim-server.sh   # Valheim-specific installer
+│   ├── install-valheim-server.sh   # Valheim-specific installer
+│   └── manage-mods.sh              # Thunderstore mod manager for Valheim shards
 └── docker/                         # Additive containerized runtime (OpenTTD, Minecraft only)
     ├── openttd/Dockerfile
     ├── minecraft/Dockerfile
