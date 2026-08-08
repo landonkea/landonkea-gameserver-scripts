@@ -9,7 +9,7 @@ on:
 jobs:
   check-no-ai-attribution:
     runs-on: ubuntu-latest
-    name: Block Co-Authored-By / AI Attribution
+    name: Block AI Author / Co-Author
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -31,24 +31,33 @@ jobs:
           FOUND=0
           for SHA in $COMMITS; do
             MSG=$(git log -1 --format="%B" "$SHA")
-            if echo "$MSG" | grep -qiE "Co-Authored-By|Generated with.*[Cc]laude|Generated with.*opencode|noreply@anthropic|noreply@opencode"; then
-              echo ""
-              echo "❌ AI attribution found in commit $SHA:"
-              echo "---"
-              git log -1 --format="Subject: %s%n%nBody:%n%B" "$SHA"
-              echo "---"
-              FOUND=1
-            fi
+            AUTHOR_NAME=$(git log -1 --format="%an" "$SHA")
+            AUTHOR_EMAIL=$(git log -1 --format="%ae" "$SHA")
+            COMMITTER_NAME=$(git log -1 --format="%cn" "$SHA")
+            COMMITTER_EMAIL=$(git log -1 --format="%ce" "$SHA")
+            
+            BLOCKED="claude opencode anthropic"
+            
+            for keyword in $BLOCKED; do
+              if echo "$MSG $AUTHOR_NAME $AUTHOR_EMAIL $COMMITTER_NAME $COMMITTER_EMAIL" | grep -qi "$keyword"; then
+                echo ""
+                echo "❌ AI attribution found in commit $SHA:"
+                echo "   Author: $AUTHOR_NAME <$AUTHOR_EMAIL>"
+                echo "   Committer: $COMMITTER_NAME <$COMMITTER_EMAIL>"
+                echo "   Message preview: $(echo "$MSG" | head -3)"
+                FOUND=1
+              fi
+            done
           done
           
           if [ "$FOUND" -eq 1 ]; then
             echo ""
-            echo "❌ Commits contain AI attribution (Co-Authored-By, Generated with Claude/opencode, etc.)"
-            echo "   This is not allowed. Remove the attribution before merging."
+            echo "❌ Commits contain AI author/committer or attribution."
+            echo "   Remove all AI references before merging."
             exit 1
           fi
           
-          echo "✓ No AI attribution found in commits"
+          echo "✓ No AI attribution found"
 
       - name: Scan files for embedded attribution
         run: |
@@ -59,8 +68,6 @@ jobs:
             echo ""
             echo "❌ Files containing AI attribution references:"
             echo "$MATCHES"
-            echo ""
-            echo "Remove these references before merging."
             exit 1
           fi
           
