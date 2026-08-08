@@ -1,0 +1,67 @@
+name: Block AI Attribution
+
+on:
+  pull_request:
+    branches: [main, master, dev, staging]
+  push:
+    branches: [main, master, dev, staging]
+
+jobs:
+  check-no-ai-attribution:
+    runs-on: ubuntu-latest
+    name: Block Co-Authored-By / AI Attribution
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Scan commits for AI attribution
+        run: |
+          echo "Scanning commits for AI attribution..."
+          
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE=${{ github.event.pull_request.base.sha }}
+            HEAD=${{ github.event.pull_request.head.sha }}
+            COMMITS=$(git log --format="%H" "$BASE".."$HEAD" 2>/dev/null || git log --format="%H" "$HEAD" -1)
+          else
+            COMMITS=$(git log --format="%H" HEAD -5)
+          fi
+          
+          FOUND=0
+          for SHA in $COMMITS; do
+            MSG=$(git log -1 --format="%B" "$SHA")
+            if echo "$MSG" | grep -qiE "Co-Authored-By|Generated with.*[Cc]laude|Generated with.*opencode|noreply@anthropic|noreply@opencode"; then
+              echo ""
+              echo "❌ AI attribution found in commit $SHA:"
+              echo "---"
+              git log -1 --format="Subject: %s%n%nBody:%n%B" "$SHA"
+              echo "---"
+              FOUND=1
+            fi
+          done
+          
+          if [ "$FOUND" -eq 1 ]; then
+            echo ""
+            echo "❌ Commits contain AI attribution (Co-Authored-By, Generated with Claude/opencode, etc.)"
+            echo "   This is not allowed. Remove the attribution before merging."
+            exit 1
+          fi
+          
+          echo "✓ No AI attribution found in commits"
+
+      - name: Scan files for embedded attribution
+        run: |
+          echo "Scanning files for embedded AI attribution..."
+          MATCHES=$(grep -r -i -l "Co-Authored-By\|Generated with Claude\|Generated with opencode\|noreply@anthropic\|noreply@opencode" --include="*.md" --include="*.txt" --include="*.yml" --include="*.yaml" --include="*.json" --include="*.js" --include="*.ts" --include="*.py" --include="*.rb" --include="*.go" --include="*.java" --include="*.sh" . 2>/dev/null || true)
+          
+          if [ -n "$MATCHES" ]; then
+            echo ""
+            echo "❌ Files containing AI attribution references:"
+            echo "$MATCHES"
+            echo ""
+            echo "Remove these references before merging."
+            exit 1
+          fi
+          
+          echo "✓ No embedded AI attribution found in files"
